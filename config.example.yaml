@@ -1,0 +1,118 @@
+# ---------------------------------------------------------------------------
+# US visa appointment watcher -- the one and only application config file.
+#
+# Copy to config.yaml and edit. config.yaml is gitignored; keep it that way,
+# because credentials live in it.
+#
+#   config.yaml   application config, including secrets   <- this file
+#   .env          Docker knobs only (published port, TZ)  <- read by Compose
+#   data/         the JSON store the app writes at runtime
+#
+# ${VAR} placeholders are still expanded from the environment if you prefer to
+# inject something that way, but nothing here requires it.
+# ---------------------------------------------------------------------------
+
+# TEST MODE. Polls and reports matches but never submits a booking.
+# Leave it true until you have watched a few sweeps and trust the output.
+test_mode: true
+
+# Seconds between sweeps. Every sweep hits one JSON endpoint per
+# (application x consulate). Going below ~180 is asking to be rate limited.
+poll_interval: 300
+
+# Where the app keeps its JSON store (store.json is created inside).
+data_dir: data
+
+# CapSolver key. Only needed when the site decides to arm reCAPTCHA -- it is
+# dormant on a clean session. Without a key an armed challenge fails the login.
+# https://docs.capsolver.com/en/api/
+capsolver_api_key: ""
+
+telegram:
+  # 1. /newbot to @BotFather, copy the token it replies with
+  # 2. send your new bot a message (it cannot see you otherwise), then read
+  #    chat.id from https://api.telegram.org/bot<TOKEN>/getUpdates
+  # Verify with:  uv run usvisa --test-telegram
+  bot_token: ""
+  chat_id: ""
+  # Also ping after a sweep that found nothing. Noisy; off by default.
+  notify_on_no_availability: false
+
+# Metrics are pushed to New Relic after every sweep -- no agent, no sidecar,
+# just an HTTPS POST. The free tier is far more than this volume needs.
+# license_key is the ingest key: Account settings -> API keys ->
+# "INGEST - LICENSE". It is NOT a user API key.
+# Check it with:  uv run usvisa --test-newrelic
+newrelic:
+  license_key: ""
+  region: us            # us | eu | jp -- must match your account's data centre
+  # auto   -- system DNS, falling back to DNS-over-HTTPS if an ad blocker
+  #           (AdGuard, Pi-hole) blackholes newrelic.com to 0.0.0.0
+  # system -- system DNS only
+  # doh    -- always resolve over DNS-over-HTTPS
+  dns_mode: auto
+  environment: ""       # optional label attached to every data point
+
+dashboard:
+  host: 0.0.0.0
+  port: 8000
+  # STRONGLY recommended. Without these the dashboard is unauthenticated and
+  # exposes masked emails, schedule ids and appointment dates.
+  username: admin
+  password: ""
+  # /metrics normally sits behind the same auth. Set false when a scraper on a
+  # trusted network should read it without credentials in its own config file
+  # (Prometheus does not expand ${ENV} in scrape configs).
+  metrics_require_auth: true
+
+# ---------------------------------------------------------------------------
+# Targets that every account inherits unless it overrides them.
+#
+# consulates accepts names, consular post codes, airport codes or raw facility
+# ids -- these are all equivalent:
+#   [Toronto, Vancouver] / [TRT, VAN] / [YYZ, YVR] / [94, 95]
+#
+#   Calgary CAL 89 | Halifax HAL 90 | Montreal MTL 91 | Ottawa OTT 92
+#   Quebec City QUB 93 | Toronto TRT 94 | Vancouver VAN 95
+# ---------------------------------------------------------------------------
+defaults:
+  consulates: [TRT]
+  earliest_acceptable_date: 2026-09-01
+  latest_acceptable_date: 2026-12-30
+  # true  -> poll every listed consulate, take the globally earliest match
+  # false -> walk the list in order and take the first match
+  prefer_earliest: true
+  # Date ranges to refuse even if offered.
+  exclusions: []
+  #  - [2026-10-01, 2026-10-15]
+  #  - { from: 2026-11-20, to: 2026-11-25 }
+
+accounts:
+  - name: Primary
+    email: you@example.com
+    password: ""
+
+    # Omit `applications` entirely to auto-discover every application on the
+    # account that the site still offers a scheduling action for. Each one then
+    # inherits the target above.
+    #
+    # List them explicitly to control which are touched and to give each its own
+    # consulates / date window. schedule_id is the number in the AIS URL:
+    #   https://ais.usvisa-info.com/en-ca/niv/schedule/72856817/continue_actions
+    #                                                  ^^^^^^^^
+    applications:
+      - schedule_id: "72856817"
+        label: Applicant A
+        consulates: [TRT, VAN]
+        latest_acceptable_date: 2026-12-30
+
+      - schedule_id: "72856546"
+        label: Applicant B
+        # inherits consulates and dates from the account / defaults
+
+  # Add as many accounts as you like; the dashboard counts and groups them.
+  # - name: Secondary
+  #   email: other@example.com
+  #   password: ""
+  #   consulates: [VAN]
+  #   latest_acceptable_date: 2027-03-31

@@ -1,0 +1,54 @@
+services:
+  watcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: usvisa-ca:2.0.0
+    container_name: usvisa-watcher
+    restart: unless-stopped
+
+    # Application configuration lives entirely in config.yaml.
+    # .env only supplies the Docker knobs substituted below.
+    environment:
+      TZ: ${TZ:-UTC}
+
+    # Optional escape hatch for hosts running a DNS-level blocker. AdGuard,
+    # Pi-hole and hosts-file blockers resolve newrelic.com to 0.0.0.0 as a
+    # tracker domain, which surfaces as "connection refused" on the metrics
+    # push. Overriding `dns:` does NOT help when the blocker intercepts port 53
+    # at the network level -- fix it in the blocker instead (allowlist
+    # newrelic.com, or exclude the Docker/WSL processes from filtering).
+    #
+    # As a stopgap you can pin the address, at the cost of breaking whenever
+    # New Relic rotates it:
+    # extra_hosts:
+    #   - "metric-api.newrelic.com:162.247.241.10"
+
+    ports:
+      # Bound to localhost by default. Only widen DASHBOARD_BIND to 0.0.0.0 once
+      # dashboard.password is set in config.yaml, and prefer a TLS proxy.
+      - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-8000}:8000"
+
+    volumes:
+      # The single config file, read-only inside the container.
+      - ./config.yaml:/app/config.yaml:ro
+      # The JSON store, so restarts keep availability history and bookings.
+      - watcher-data:/app/data
+
+    # The process only makes outbound HTTPS calls and serves one port.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  watcher-data:

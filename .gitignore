@@ -128,6 +128,11 @@ ENV/
 env.bak/
 venv.bak/
 
+# Live configuration and runtime state (config.example.yaml IS committed)
+config.yaml
+data/
+store.json
+
 # Spyder project settings
 .spyderproject
 .spyproject

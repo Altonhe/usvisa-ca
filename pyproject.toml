@@ -1,0 +1,44 @@
+[project]
+name = "usvisa-ca"
+version = "2.0.0"
+description = "Watch and book US visa interview appointments in Canada (ais.usvisa-info.com/en-ca)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+# Exact versions are pinned in uv.lock; the ranges here only express the
+# minimum each module was written against.
+dependencies = [
+    "requests>=2.32.3",
+    "certifi>=2024.8.30",
+    "urllib3>=2.2.3",
+    "pyyaml>=6.0.2",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "jinja2>=3.1.4",
+]
+
+[project.scripts]
+usvisa = "app.main:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.3",
+    "httpx>=0.28.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+# The dashboard template is loaded from disk at runtime.
+artifacts = ["templates/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.uv]
+package = true

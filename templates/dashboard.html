@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>US Visa Appointment Watcher</title>
+<style>
+  :root {
+    --bg: #0f1116; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --fg: #e6e8ee; --muted: #9aa3b2;
+    --ok: #3fb950; --warn: #d29922; --bad: #f85149; --info: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 18px 24px; border-bottom: 1px solid var(--line);
+    display: flex; flex-wrap: wrap; gap: 16px; align-items: baseline;
+  }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 12px; }
+  main { padding: 20px 24px 48px; max-width: 1400px; }
+  .cards { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 22px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 18px; min-width: 128px;
+  }
+  .card .n { font-size: 26px; font-weight: 650; }
+  .card .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .banner {
+    border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px;
+    border: 1px solid transparent;
+  }
+  .banner.warn { background: rgba(210,153,34,.12); border-color: rgba(210,153,34,.4); color: #f0c674; }
+  .banner.bad  { background: rgba(248,81,73,.12);  border-color: rgba(248,81,73,.4);  color: #ff9b95; }
+  .banner.info { background: rgba(88,166,255,.10); border-color: rgba(88,166,255,.35); color: #a5cdff; }
+  section.account {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; margin-bottom: 18px; overflow: hidden;
+  }
+  .account-head {
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline;
+  }
+  .account-head strong { font-size: 15px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 9px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover { background: var(--panel2); }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  .pill {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; letter-spacing: .02em;
+  }
+  .pill.booked   { background: rgba(63,185,80,.16);  color: var(--ok); }
+  .pill.match    { background: rgba(88,166,255,.16); color: var(--info); }
+  .pill.watching { background: rgba(154,163,178,.14); color: var(--muted); }
+  .pill.inactive { background: rgba(154,163,178,.10); color: #6d7686; }
+  .pill.error    { background: rgba(248,81,73,.16);  color: var(--bad); }
+  .kind { color: var(--muted); font-size: 11px; }
+  .target { white-space: nowrap; }
+  .cons { display: flex; flex-direction: column; gap: 3px; }
+  .cons div { font-size: 12px; white-space: nowrap; }
+  .cons .name { display: inline-block; min-width: 84px; color: var(--muted); }
+  .v-match { color: var(--info); font-weight: 600; }
+  .v-none  { color: #6d7686; }
+  .v-out   { color: var(--warn); }
+  .v-error { color: var(--bad); }
+  .msg { color: var(--muted); font-size: 12px; }
+  .log {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 16px; max-height: 320px; overflow: auto;
+  }
+  .log pre { margin: 0; font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; color: var(--muted); white-space: pre-wrap; }
+  a { color: var(--info); }
+</style>
+</head>
+<body>
+<header>
+  <h1>US Visa Appointment Watcher</h1>
+  <span class="sub">
+    sweep #{{ data.sweep_count }}
+    &middot; worker {{ data.worker_status }}
+    &middot; every {{ poll_interval }}s
+    {% if data.last_sweep_finished %}&middot; last finished {{ data.last_sweep_finished }}{% endif %}
+    {% if data.next_sweep_at %}&middot; next {{ data.next_sweep_at }}{% endif %}
+  </span>
+  <span class="sub" style="margin-left:auto">
+    generated {{ data.generated_at }} &middot; <a href="/api/state">JSON</a>
+  </span>
+</header>
+
+<main>
+  {% if data.test_mode %}
+  <div class="banner info">
+    <strong>TEST MODE.</strong> Availability is polled and matches are reported, but no
+    booking is ever submitted. Set <code>test_mode: false</code> in
+    <code>config.yaml</code> to let it book for real.
+  </div>
+  {% else %}
+  <div class="banner warn">
+    <strong>LIVE MODE.</strong> A matching slot will be booked automatically.
+  </div>
+  {% endif %}
+
+  {% if not auth_enabled %}
+  <div class="banner bad">
+    <strong>This dashboard has no authentication.</strong> Anyone who can reach this
+    port can see your applications and appointment dates. Set
+    <code>dashboard.username</code> and <code>dashboard.password</code> in
+    <code>config.yaml</code>, and avoid publishing the port to the internet.
+  </div>
+  {% endif %}
+
+  {% if data.worker_error %}
+  <div class="banner bad">Worker error: {{ data.worker_error }}</div>
+  {% endif %}
+
+  {% if not worker_running and data.worker_status not in ['finished'] %}
+  <div class="banner bad">The polling thread is not running.</div>
+  {% endif %}
+
+  <div class="cards">
+    <div class="card"><div class="n">{{ data.totals.accounts }}</div><div class="l">Accounts</div></div>
+    <div class="card"><div class="n">{{ data.totals.applications }}</div><div class="l">Applications</div></div>
+    <div class="card"><div class="n">{{ data.totals.active }}</div><div class="l">Watching</div></div>
+    <div class="card"><div class="n" style="color:var(--info)">{{ data.totals.matches }}</div><div class="l">Matches</div></div>
+    <div class="card"><div class="n" style="color:var(--ok)">{{ data.totals.booked }}</div><div class="l">Booked</div></div>
+    <div class="card">
+      <div class="n" style="font-size:15px;padding-top:7px">
+        {{ 'on' if capsolver_enabled else 'off' }} / {{ 'on' if telegram_enabled else 'off' }}
+      </div>
+      <div class="l">CapSolver / Telegram</div>
+    </div>
+  </div>
+
+  {% if not data.accounts %}
+    <div class="banner warn">No account state yet. The first sweep is still running.</div>
+  {% endif %}
+
+  {% for account in data.accounts %}
+  <section class="account">
+    <div class="account-head">
+      <strong>{{ account.name }}</strong>
+      <span class="sub"><code>{{ account.email_masked }}</code></span>
+      <span class="sub">{{ account.application_count }} application(s)</span>
+      {% if account.last_login %}<span class="sub">signed in {{ account.last_login }}</span>{% endif %}
+      {% if account.pending_discovery %}<span class="pill watching">auto-discovery pending</span>{% endif %}
+      {% if account.error %}<span class="pill error">{{ account.error }}</span>{% endif %}
+    </div>
+    {% if not account.applications %}
+    <div style="padding:12px 16px;color:var(--muted);font-size:13px">
+      {% if account.error %}
+        No applications listed yet because this account could not be read.
+      {% elif account.pending_discovery %}
+        This account uses auto-discovery; its applications appear after the first
+        successful sign-in. List them explicitly under
+        <code>applications:</code> in <code>config.yaml</code> to see them here right away.
+      {% else %}
+        No applications configured.
+      {% endif %}
+    </div>
+    {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th>Application</th>
+          <th>Status</th>
+          <th>Target consulates</th>
+          <th class="target">Target date</th>
+          <th>Current appointment</th>
+          <th>Availability per consulate</th>
+          <th>Note</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for app in account.applications %}
+        <tr>
+          <td>
+            <div>{{ app.label or app.schedule_id }}</div>
+            <div class="kind"><code>{{ app.schedule_id }}</code>
+              &middot;
+              {% if app.kind == 'first_time' %}never booked
+              {% elif app.kind == 'reschedule' %}rescheduling
+              {% elif app.kind == 'done' %}no action available
+              {% else %}unknown{% endif %}
+            </div>
+          </td>
+          <td><span class="pill {{ app.state }}">{{ app.state }}</span></td>
+          <td>
+            {% if app.target_consulates %}
+              {{ app.target_consulates | join(', ') }}
+            {% else %}<span class="v-none">none</span>{% endif %}
+          </td>
+          <td class="target">
+            {% if app.target_latest and app.target_earliest %}
+              {{ app.target_earliest }} &rarr; {{ app.target_latest }}
+            {% elif app.target_latest %}
+              before <strong>{{ app.target_latest }}</strong>
+            {% elif app.target_earliest %}
+              after {{ app.target_earliest }}
+            {% else %}
+              <span class="v-none">any date</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if app.booked_for %}
+              <span class="v-match">{{ app.booked_for }} {{ app.booked_time }}</span><br>
+              <span class="kind">{{ app.booked_consulate }}</span>
+            {% elif app.current_appointment %}
+              {{ app.current_appointment }}
+            {% else %}
+              <span class="v-none">none</span>
+            {% endif %}
+          </td>
+          <td>
+            <div class="cons">
+            {% for c in app.consulates %}
+              <div>
+                <span class="name">{{ c.name }}</span>
+                {% if c.status == 'error' %}<span class="v-error">request failed</span>
+                {% elif c.status == 'none' %}<span class="v-none">no availability</span>
+                {% elif c.status == 'match' %}<span class="v-match">{{ c.earliest_acceptable }}</span>
+                  <span class="kind">({{ c.acceptable_count }} of {{ c.total_days }} ok)</span>
+                {% else %}<span class="v-out">{{ c.earliest }}</span>
+                  <span class="kind">(outside window)</span>
+                {% endif %}
+              </div>
+            {% else %}
+              <div class="v-none">not polled yet</div>
+            {% endfor %}
+            </div>
+          </td>
+          <td class="msg">
+            {{ app.message }}
+            {% if app.last_checked %}<div class="kind">{{ app.last_checked }}</div>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </section>
+  {% endfor %}
+
+  <h1 style="font-size:14px;margin:24px 0 10px">Recent activity</h1>
+  <div class="log">
+    <pre>{% for line in data.log %}{{ line }}
+{% endfor %}</pre>
+  </div>
+</main>
+</body>
+</html>

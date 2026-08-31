@@ -1,0 +1,28 @@
+.git
+.gitignore
+.github
+.idea
+.vscode
+
+# Secrets and local state must never enter the image.
+.env
+.env.*
+!.env.example
+config.yaml
+data/
+*.log
+
+# Local Python artefacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Docs and tests are not needed at runtime
+tests/
+Dockerfile
+docker-compose.yml
+.dockerignore
