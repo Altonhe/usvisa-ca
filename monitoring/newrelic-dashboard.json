@@ -6,11 +6,11 @@
   "pages": [
     {
       "name": "Overview",
-      "description": "Where the earliest slot sits, per application and consulate.",
+      "description": "Where the earliest slot sits, per application and consulate. All charts follow the time picker; set it to 7 days for the trends to mean anything.",
       "widgets": [
         {
-          "title": "Earliest slot (days from now)",
-          "layout": { "column": 1, "row": 1, "width": 4, "height": 3 },
+          "title": "Earliest slot right now (days out)",
+          "layout": { "column": 1, "row": 1, "width": 3, "height": 3 },
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.billboard" },
           "rawConfiguration": {
@@ -18,47 +18,64 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT latest(usvisa.earliest_slot_days) AS 'Days out' FACET application, consulate SINCE 30 minutes ago LIMIT 20"
+                "query": "FROM Metric SELECT latest(usvisa.earliest_slot_days) AS 'Now' FACET application, consulate LIMIT 20"
               }
             ],
-            "platformOptions": { "ignoreTimeRange": true }
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Best ever offered in this window",
+          "description": "min() across the whole picker range. If this is far below the value on the left, an earlier slot appeared and was taken before the next sweep.",
+          "layout": { "column": 4, "row": 1, "width": 3, "height": 3 },
+          "linkedEntityGuids": null,
+          "visualization": { "id": "viz.billboard" },
+          "rawConfiguration": {
+            "facet": { "showOtherSeries": false },
+            "nrqlQueries": [
+              {
+                "accountIds": [ 8461506 ],
+                "query": "FROM Metric SELECT min(usvisa.earliest_slot_days) AS 'Best seen' FACET application, consulate LIMIT 20"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
           }
         },
         {
           "title": "Pipeline",
-          "layout": { "column": 5, "row": 1, "width": 3, "height": 3 },
+          "layout": { "column": 7, "row": 1, "width": 2, "height": 3 },
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.billboard" },
           "rawConfiguration": {
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT latest(usvisa.applications_count) AS 'Watched', latest(usvisa.matches_count) AS 'Matching', latest(usvisa.booked_count) AS 'Booked' SINCE 30 minutes ago"
+                "query": "FROM Metric SELECT latest(usvisa.applications_count) AS 'Watched', max(usvisa.matches_count) AS 'Matched', latest(usvisa.booked_count) AS 'Booked'"
               }
             ],
-            "platformOptions": { "ignoreTimeRange": true },
-            "thresholds": [
-              { "alertSeverity": "NOT_ALERTING", "value": 1 }
-            ]
+            "platformOptions": { "ignoreTimeRange": false }
           }
         },
         {
           "title": "Health",
-          "layout": { "column": 8, "row": 1, "width": 3, "height": 3 },
+          "layout": { "column": 9, "row": 1, "width": 2, "height": 3 },
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.billboard" },
           "rawConfiguration": {
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT latest(usvisa.worker_running) AS 'Worker', latest(usvisa.account_login_ok) AS 'Login', latest(usvisa.sweeps_total) AS 'Sweeps' SINCE 30 minutes ago"
+                "query": "FROM Metric SELECT latest(usvisa.worker_running) AS 'Worker', min(usvisa.account_login_ok) AS 'Login', latest(usvisa.sweeps_total) AS 'Sweeps'"
               }
             ],
-            "platformOptions": { "ignoreTimeRange": true }
+            "platformOptions": { "ignoreTimeRange": false },
+            "thresholds": [
+              { "alertSeverity": "CRITICAL", "value": 0 }
+            ]
           }
         },
         {
-          "title": "Staleness (s)",
+          "title": "Worst staleness (s)",
           "layout": { "column": 11, "row": 1, "width": 2, "height": 3 },
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.billboard" },
@@ -66,10 +83,10 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT max(usvisa.seconds_since_check) AS 'Since last poll' SINCE 2 hours ago"
+                "query": "FROM Metric SELECT max(usvisa.seconds_since_check) AS 'Since last poll'"
               }
             ],
-            "platformOptions": { "ignoreTimeRange": true },
+            "platformOptions": { "ignoreTimeRange": false },
             "thresholds": [
               { "alertSeverity": "WARNING", "value": 600 },
               { "alertSeverity": "CRITICAL", "value": 900 }
@@ -78,7 +95,8 @@
         },
 
         {
-          "title": "Earliest slot over time — lower is better",
+          "title": "Earliest slot offered — min per bucket, so brief dips survive",
+          "description": "min() rather than latest(): a slot that appears for one sweep and is taken before the next would be invisible with latest().",
           "layout": { "column": 1, "row": 4, "width": 8, "height": 4 },
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.line" },
@@ -88,7 +106,7 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT latest(usvisa.earliest_slot_days) FACET application, consulate TIMESERIES AUTO SINCE 7 days ago"
+                "query": "FROM Metric SELECT min(usvisa.earliest_slot_days) FACET application, consulate TIMESERIES AUTO"
               }
             ],
             "platformOptions": { "ignoreTimeRange": false },
@@ -96,7 +114,7 @@
           }
         },
         {
-          "title": "Current state per consulate",
+          "title": "Now vs best seen",
           "layout": { "column": 9, "row": 4, "width": 4, "height": 4 },
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.table" },
@@ -105,10 +123,10 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT latest(usvisa.earliest_slot_days) AS 'Earliest (d)', latest(usvisa.earliest_acceptable_slot_days) AS 'In window (d)', latest(usvisa.available_days) AS 'Offered' FACET application, consulate SINCE 30 minutes ago LIMIT 50"
+                "query": "FROM Metric SELECT latest(usvisa.earliest_slot_days) AS 'Now (d)', min(usvisa.earliest_slot_days) AS 'Best (d)', min(usvisa.earliest_acceptable_slot_days) AS 'In window (d)', latest(usvisa.available_days) AS 'Offered' FACET application, consulate LIMIT 50"
               }
             ],
-            "platformOptions": { "ignoreTimeRange": true }
+            "platformOptions": { "ignoreTimeRange": false }
           }
         },
 
@@ -123,7 +141,7 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT derivative(usvisa.earliest_slot_days, 1 day) FACET consulate TIMESERIES AUTO SINCE 7 days ago"
+                "query": "FROM Metric SELECT derivative(usvisa.earliest_slot_days, 1 day) FACET consulate TIMESERIES AUTO"
               }
             ],
             "platformOptions": { "ignoreTimeRange": false },
@@ -141,7 +159,7 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT latest(usvisa.available_days) FACET consulate TIMESERIES AUTO SINCE 24 hours ago"
+                "query": "FROM Metric SELECT max(usvisa.available_days) FACET consulate TIMESERIES AUTO"
               }
             ],
             "platformOptions": { "ignoreTimeRange": false }
@@ -158,7 +176,7 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT latest(usvisa.target_deadline_days) FACET application TIMESERIES AUTO SINCE 7 days ago"
+                "query": "FROM Metric SELECT min(usvisa.target_deadline_days) FACET application TIMESERIES AUTO"
               }
             ],
             "platformOptions": { "ignoreTimeRange": false },
@@ -172,7 +190,7 @@
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.markdown" },
           "rawConfiguration": {
-            "text": "### How to read it\n\n**`earliest_slot_days`** is how many days from *now* the earliest offered appointment is. It is recomputed on every push, so it ticks down on its own. Lower is better.\n\n**`In window (d)`** (`usvisa.earliest_acceptable_slot_days`) only exists when a slot actually falls inside your configured `earliest/latest_acceptable_date`. **An empty column means nothing matched yet — that is normal, not a gap in the data.** When it appears, Telegram has already fired and `Matching` above goes from 0 to 1.\n\n**No data for a consulate at all** means it returned zero availability. Metrics are deliberately omitted rather than sent as `0`, because `0` would read as \"a slot is free today\". Check `usvisa.consulate_status` (attribute `status` = `none` / `out-of-window` / `match` / `error`) and `usvisa.consulate_poll_ok` to tell \"nothing free\" from \"request failed\".\n\n**Staleness** should stay under your `poll_interval` (default 300s). Above ~900s the watcher has stopped sweeping."
+            "text": "### How to read it\n\n**Set the time picker (top right) to `Last 7 days`.** Every chart here follows it — New Relic's picker supersedes any `SINCE` in a query, so none of these queries pin their own window. The trend and Movement charts need more than a day of history to say anything.\n\n**`min()`, not `latest()`.** `earliest_slot_days` is sampled every `poll_interval`. A chart bucket holds several samples, and `latest()` would keep only the last one — so a slot that appeared for a single sweep and was taken before the next would vanish from the graph. `min()` keeps the dip, which is the whole event worth seeing. The one place `latest()` is used is the *right now* tile, where the current state is the question.\n\n**\"Now\" far above \"Best seen\"** means an earlier slot did appear during the window and is already gone. If that keeps happening well inside your target window, the bot is losing races and `poll_interval` is too slow.\n\n**Day counts are computed when each point is pushed.** A point from a month ago means \"this many days out *as of then*\", which is what makes the trend meaningful — but only the newest point literally means \"from today\".\n\n**A blank `In window (d)`** means nothing has ever fallen inside your `earliest/latest_acceptable_date` — normal, not missing data. **A consulate absent entirely** returned zero availability: metrics are omitted rather than sent as `0`, because `0` would read as \"a slot is free today\". Use `usvisa.consulate_status` (`status` = `none` / `out-of-window` / `match` / `error`) and `usvisa.consulate_poll_ok` to tell \"nothing free\" from \"request failed\"."
           }
         }
       ]
@@ -191,7 +209,7 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT latest(usvisa.sweeps_total) TIMESERIES AUTO SINCE 24 hours ago"
+                "query": "FROM Metric SELECT max(usvisa.sweeps_total) TIMESERIES AUTO"
               }
             ],
             "platformOptions": { "ignoreTimeRange": false },
@@ -199,7 +217,7 @@
           }
         },
         {
-          "title": "Login and worker status",
+          "title": "Login and worker status — min(), so any blip shows",
           "layout": { "column": 5, "row": 1, "width": 4, "height": 3 },
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.line" },
@@ -209,7 +227,7 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT latest(usvisa.account_login_ok) AS 'Login OK', latest(usvisa.worker_running) AS 'Worker running', latest(usvisa.up) AS 'Reporting' TIMESERIES AUTO SINCE 24 hours ago"
+                "query": "FROM Metric SELECT min(usvisa.account_login_ok) AS 'Login OK', min(usvisa.worker_running) AS 'Worker running', min(usvisa.up) AS 'Reporting' TIMESERIES AUTO"
               }
             ],
             "platformOptions": { "ignoreTimeRange": false },
@@ -227,7 +245,7 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT max(usvisa.seconds_since_check) FACET application TIMESERIES AUTO SINCE 12 hours ago"
+                "query": "FROM Metric SELECT max(usvisa.seconds_since_check) FACET application TIMESERIES AUTO"
               }
             ],
             "platformOptions": { "ignoreTimeRange": false },
@@ -244,10 +262,10 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT latest(usvisa.consulate_status) AS 'Reporting' FACET application, consulate, status SINCE 30 minutes ago LIMIT 100"
+                "query": "FROM Metric SELECT count(usvisa.consulate_status) AS 'Samples' FACET application, consulate, status LIMIT 100"
               }
             ],
-            "platformOptions": { "ignoreTimeRange": true }
+            "platformOptions": { "ignoreTimeRange": false }
           }
         },
         {
@@ -260,10 +278,10 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT latest(usvisa.application_state) AS 'Reporting' FACET account, application, schedule_id, state SINCE 30 minutes ago LIMIT 100"
+                "query": "FROM Metric SELECT count(usvisa.application_state) AS 'Samples' FACET account, application, schedule_id, state LIMIT 100"
               }
             ],
-            "platformOptions": { "ignoreTimeRange": true }
+            "platformOptions": { "ignoreTimeRange": false }
           }
         },
         {
@@ -275,10 +293,10 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM NrIntegrationError SELECT timestamp, category, message, name SINCE 3 days ago LIMIT 50"
+                "query": "FROM NrIntegrationError SELECT timestamp, category, message, name LIMIT 50"
               }
             ],
-            "platformOptions": { "ignoreTimeRange": true }
+            "platformOptions": { "ignoreTimeRange": false }
           }
         },
         {
@@ -290,10 +308,10 @@
             "nrqlQueries": [
               {
                 "accountIds": [ 8461506 ],
-                "query": "FROM Metric SELECT uniqueCount(timestamp) AS 'Data points' WHERE metricName LIKE 'usvisa.%' FACET metricName SINCE 6 hours ago LIMIT 50"
+                "query": "FROM Metric SELECT count(*) AS 'Data points' WHERE metricName LIKE 'usvisa.%' FACET metricName LIMIT 50"
               }
             ],
-            "platformOptions": { "ignoreTimeRange": true }
+            "platformOptions": { "ignoreTimeRange": false }
           }
         }
       ]

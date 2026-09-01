@@ -65,6 +65,19 @@ class CaptchaBlocked(LoginFailed):
     """A challenge was served but no solver is configured."""
 
 
+class SessionExpired(AisError):
+    """The cookie jar is no longer valid; a fresh sign-in is needed."""
+
+
+class TransientNetworkError(AisError):
+    """A timeout or connection error that says nothing about the session.
+
+    Raised so the worker can keep the existing session instead of discarding it:
+    re-authenticating on every network hiccup is both wasteful and the pattern
+    most likely to get reCAPTCHA armed.
+    """
+
+
 @dataclass
 class Schedule:
     """One application (one ``schedule_id``) on an account."""
@@ -182,10 +195,32 @@ class AisClient:
     # -- plumbing --------------------------------------------------------
 
     def _get_page(self, url: str, referer: str = "") -> Page:
+        """GET an HTML page, retrying once on a transient network error.
+
+        GETs here are idempotent, so a single retry absorbs the read timeouts the
+        site produces occasionally. That matters because the alternative -- giving
+        up and forcing a fresh sign-in next sweep -- throws away a perfectly good
+        session, and re-authenticating is the action most likely to arm the
+        captcha.
+        """
         headers = {"Referer": referer} if referer else {}
-        resp = self.session.get(url, headers=headers, timeout=self.timeout)
-        resp.raise_for_status()
-        return Page(resp.text, base_url=resp.url)
+        last: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                resp = self.session.get(url, headers=headers, timeout=self.timeout)
+                resp.raise_for_status()
+                return Page(resp.text, base_url=resp.url)
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last = exc
+                if attempt == 0:
+                    self._log(
+                        f"{type(exc).__name__} on {url.rsplit('/', 2)[-2:][0]}…, "
+                        "retrying once"
+                    )
+                    time.sleep(2)
+        raise TransientNetworkError(
+            f"{type(last).__name__} after 2 attempts: {url}"
+        ) from last
 
     def _get_json(self, url: str, referer: str = ""):
         """GET a JSON endpoint.
@@ -377,6 +412,13 @@ class AisClient:
                 found.append(m.group(1))
 
         if not found:
+            # A lapsed session serves the sign-in page with HTTP 200, which would
+            # otherwise be reported as a layout change. Say what it really is so
+            # the log does not send you hunting for a parser bug.
+            if page.form_by_id("sign_in_form"):
+                raise SessionExpired(
+                    "the AIS session has lapsed; re-authenticating on the next sweep"
+                )
             raise AisError(
                 f"no applications found on {self.landing_url}; the landing page "
                 "layout may have changed"

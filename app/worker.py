@@ -21,7 +21,8 @@ import traceback
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
-from .ais_client import (AisClient, AisError, LoginFailed, Schedule, Slot,
+from .ais_client import (AisClient, AisError, LoginFailed, Schedule,
+                         SessionExpired, Slot, TransientNetworkError,
                          parse_site_date)
 from .capsolver import CapSolver, CapSolverError
 from .config import Account, Application, Config, Target
@@ -205,6 +206,28 @@ class Worker:
             try:
                 self._sweep_account(account)
                 self._failures[account.name] = 0
+            except SessionExpired as exc:
+                # Expected periodically; not a failure worth counting or alerting.
+                self.log(f"[{account.name}] {exc}")
+                self._clients.pop(account.name, None)
+            except TransientNetworkError as exc:
+                # The network blipped, not the session. Keep the cookies and try
+                # again next sweep; a full traceback here is pure noise.
+                count = self._failures.get(account.name, 0) + 1
+                self._failures[account.name] = count
+                self.log(
+                    f"[{account.name}] network error, keeping the session: {exc} "
+                    f"(consecutive: {count})"
+                )
+                self.store.set_account_error(
+                    account.name, f"network error: {exc}"
+                )
+                if count == self.config.max_consecutive_failures:
+                    self.notifier.account_error(
+                        account.name,
+                        f"{count} consecutive network errors reaching the site. "
+                        f"Still retrying every {self.config.poll_interval}s.",
+                    )
             except (LoginFailed, CapSolverError) as exc:
                 self._handle_account_failure(account, f"login failed: {exc}")
             except AisError as exc:

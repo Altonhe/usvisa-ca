@@ -290,10 +290,25 @@ added from an account you don't have access to"*. Your ID is the number in any
 New Relic URL (`.../accounts/<id>/...` or `?account=<id>`) and is shown beside the
 name in the account switcher.
 
-Two things will look empty at first, both expected: the **Movement** chart needs
-more than a day of history before `derivative` has anything to plot, and the
-**In window (d)** column stays blank until a slot actually falls inside your
-configured date range.
+Two conventions in these queries are deliberate:
+
+- **No query pins its own time range.** New Relic's time picker
+  [supersedes any `SINCE`/`UNTIL`](https://docs.newrelic.com/docs/nrql/using-nrql/query-time-range/)
+  unless a widget sets *Ignore time picker*, so a hardcoded `SINCE` is either dead
+  or quietly makes the widget lie when you change the picker. Every chart follows
+  the picker; **set it to `Last 7 days`** or the trend and movement charts have
+  nothing to plot.
+- **Aggregates use `min()`, not `latest()`.** `earliest_slot_days` is sampled once
+  per `poll_interval`, and a chart bucket holds several samples. `latest()` keeps
+  only the last one, so a slot that appeared for a single sweep and was taken
+  before the next would vanish from the graph — which is exactly the event worth
+  seeing. `latest()` is used only on the "right now" tile, where current state is
+  the question. The **Now vs best seen** table shows both side by side: a large
+  gap means an earlier slot came and went inside the window.
+
+The **In window (d)** column stays blank until a slot actually falls inside your
+configured date range, and the **Movement** chart needs more than a day of history
+before `derivative` has anything to plot. Both are expected, not missing data.
 
 ### If the push fails with "connection refused"
 
