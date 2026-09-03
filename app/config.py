@@ -176,6 +176,31 @@ class Application:
 
 
 @dataclass
+class Group:
+    """A joint constraint across several applications on the same account.
+
+    Unlike a plain ``Target``, a group is not satisfied by each member finding
+    its own best day independently: every member must land on the *same* day,
+    and only once that day carries enough capacity for all of them. Typical
+    use: two applicants who must attend together, watching a consulate that
+    is small enough that grabbing it alone is risky.
+    """
+
+    members: List[str] = field(default_factory=list)  # schedule_ids
+    consulates: List[int] = field(default_factory=list)
+    target: Target = field(default_factory=Target)
+    # Minimum number of distinct time slots the day must offer (summed across
+    # members' /times.json calls) before booking is attempted. Below this the
+    # day is treated as not-yet-safe and left for the next sweep -- with only
+    # one slot, both members racing for it would likely mean one succeeds and
+    # one fails.
+    min_slots: int = 2
+
+    def describe_consulates(self) -> str:
+        return ", ".join(consulate_name(c) for c in self.consulates) or "none"
+
+
+@dataclass
 class Account:
     """One AIS login, holding one or more applications."""
 
@@ -184,6 +209,7 @@ class Account:
     password: str
     target: Target = field(default_factory=Target)
     applications: List[Application] = field(default_factory=list)
+    groups: List[Group] = field(default_factory=list)
 
     @property
     def auto_discover(self) -> bool:
@@ -319,6 +345,54 @@ def _parse_target(raw: Dict[str, Any], base: Target, label: str) -> Target:
     )
 
 
+def _parse_group(
+    raw: Dict[str, Any],
+    index: int,
+    account_label: str,
+    account_target: Target,
+    known_ids: List[str],
+) -> Group:
+    label = f"{account_label}.groups[{index}]"
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{label}: expected a mapping, got {type(raw).__name__}")
+
+    members = [str(m).strip() for m in (raw.get("members") or [])]
+    if len(members) < 2:
+        raise ConfigError(f"{label}.members needs at least 2 schedule ids")
+    for m in members:
+        if m not in known_ids:
+            raise ConfigError(
+                f"{label}.members references schedule_id {m!r}, which is not "
+                f"listed in {account_label}.applications"
+            )
+    if len(set(members)) != len(members):
+        raise ConfigError(f"{label}.members lists the same schedule_id twice")
+
+    if "consulates" not in raw or raw["consulates"] in (None, ""):
+        raise ConfigError(f"{label}.consulates is required")
+    value = raw["consulates"]
+    if isinstance(value, list):
+        value = ",".join(str(v) for v in value)
+    try:
+        consulates = parse_consulate_list(value, default_all=False)
+    except ValueError as exc:
+        raise ConfigError(f"{label}.consulates: {exc}") from exc
+    if not consulates:
+        raise ConfigError(f"{label}.consulates resolved to an empty list")
+
+    target = _parse_target(raw, account_target, label)
+    min_slots = _as_int(raw.get("min_slots"), 2, f"{label}.min_slots")
+    if min_slots < 1:
+        raise ConfigError(f"{label}.min_slots must be at least 1")
+
+    return Group(
+        members=members,
+        consulates=consulates,
+        target=target,
+        min_slots=min_slots,
+    )
+
+
 def _parse_account(raw: Dict[str, Any], defaults: Target, index: int) -> Account:
     label = f"accounts[{index}]"
     if not isinstance(raw, dict):
@@ -358,12 +432,36 @@ def _parse_account(raw: Dict[str, Any], defaults: Target, index: int) -> Account
             )
         )
 
+    known_ids = [a.schedule_id for a in applications]
+    groups: List[Group] = []
+    for j, group_raw in enumerate(raw.get("groups") or []):
+        group = _parse_group(group_raw, j, label, account_target, known_ids)
+        groups.append(group)
+
+    # A group takes over its consulates for its members entirely: letting a
+    # member also poll the same consulate on its own would let it book alone
+    # the instant a day appears, defeating the "must be the same day" promise
+    # the group exists to make.
+    by_id = {a.schedule_id: a for a in applications}
+    for group in groups:
+        for member in group.members:
+            app = by_id[member]
+            clash = set(app.target.consulates) & set(group.consulates)
+            if clash:
+                names = ", ".join(consulate_name(c) for c in clash)
+                raise ConfigError(
+                    f"{label}: {app.display_name or member} watches {names} both "
+                    f"on its own and via a group -- remove {names} from its own "
+                    "consulates list, the group already covers it"
+                )
+
     return Account(
         name=name,
         email=email,
         password=password,
         target=account_target,
         applications=applications,
+        groups=groups,
     )
 
 

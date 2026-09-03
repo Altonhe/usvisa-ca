@@ -459,3 +459,138 @@ def test_http_errors_are_not_treated_as_transient(monkeypatch):
     monkeypatch.setattr(client.session, "get", lambda *a, **k: ServerError())
     with pytest.raises(requests.HTTPError):
         client._get_page("https://ais.usvisa-info.com/en-ca/niv")
+
+
+
+# ---------------------------------------------------------------------------
+# Groups: "must land on the same day" across two applications
+# ---------------------------------------------------------------------------
+
+class GroupClient:
+    """Fake AisClient exposing only what _sweep_group touches."""
+
+    def __init__(self, days_by_member, times_by_member_day, book_results=None):
+        self.days_by_member = days_by_member
+        self.times_by_member_day = times_by_member_day
+        self.book_results = book_results or {}
+        self.booked: list = []
+
+    def get_available_days(self, schedule_id, facility_id):
+        return self.days_by_member.get(schedule_id, [])
+
+    def get_available_times(self, schedule_id, facility_id, day):
+        return self.times_by_member_day.get((schedule_id, day), [])
+
+    def current_appointment(self, schedule_id):
+        return None
+
+    def book(self, slot, dry_run=True, retry_attempts=1, retry_delay=0.0):
+        self.booked.append(slot)
+        return self.book_results.get(slot.schedule_id, True)
+
+
+def _group_setup(tmp_path, days_by_member, times_by_member_day, min_slots=2, book_results=None):
+    from app.config import Account, Application, Group
+
+    worker, store = build_worker(tmp_path)
+    account = Account(
+        name="A", email="a@example.com", password="p",
+        applications=[
+            Application(schedule_id="111", label="Alice", target=make_target(consulates=[94])),
+            Application(schedule_id="222", label="Bob", target=make_target(consulates=[94])),
+        ],
+        groups=[Group(
+            members=["111", "222"],
+            consulates=[91],
+            target=make_target(consulates=[91], latest=date(2026, 12, 31)),
+            min_slots=min_slots,
+        )],
+    )
+    store.register_account("A", "a@example.com")
+    store.register_application("A", "111", "Alice", make_target(consulates=[94]))
+    store.register_application("A", "222", "Bob", make_target(consulates=[94]))
+
+    client = GroupClient(days_by_member, times_by_member_day, book_results)
+    by_id = {
+        "111": (account.applications[0], Schedule(id="111", continue_url="/x")),
+        "222": (account.applications[1], Schedule(id="222", continue_url="/y")),
+    }
+    return worker, store, client, account, by_id
+
+
+def test_group_no_common_day_does_not_book(tmp_path):
+    worker, store, client, account, by_id = _group_setup(
+        tmp_path,
+        days_by_member={"111": [date(2026, 10, 1)], "222": [date(2026, 10, 5)]},
+        times_by_member_day={},
+    )
+    worker._sweep_group(account, client, account.groups[0], by_id)
+    assert client.booked == []
+    msg = store.snapshot()["accounts"][0]["applications"][0]["message"]
+    assert "no common day" in msg
+
+
+def test_group_common_day_but_not_enough_slots_waits(tmp_path):
+    """Only one time slot total between both members: must not book yet."""
+    day = date(2026, 10, 10)
+    worker, store, client, account, by_id = _group_setup(
+        tmp_path,
+        days_by_member={"111": [day], "222": [day]},
+        times_by_member_day={("111", day): ["07:45"], ("222", day): []},
+        min_slots=2,
+    )
+    worker._sweep_group(account, client, account.groups[0], by_id)
+    assert client.booked == []
+    msg = store.snapshot()["accounts"][0]["applications"][0]["message"]
+    assert "waiting for" in msg
+
+
+def test_group_enough_slots_books_both_members_with_distinct_times(tmp_path):
+    day = date(2026, 10, 10)
+    worker, store, client, account, by_id = _group_setup(
+        tmp_path,
+        days_by_member={"111": [day], "222": [day]},
+        times_by_member_day={
+            ("111", day): ["07:45", "08:00"],
+            ("222", day): ["07:45", "08:00"],
+        },
+        min_slots=2,
+    )
+    worker._sweep_group(account, client, account.groups[0], by_id)
+    assert len(client.booked) == 2
+    slots = {s.schedule_id: s for s in client.booked}
+    assert slots["111"].day == day and slots["222"].day == day
+    assert slots["111"].facility_id == 91 and slots["222"].facility_id == 91
+    # Distinct times so the two booking requests do not collide.
+    assert slots["111"].time != slots["222"].time
+
+
+def test_group_picks_earliest_common_day_within_window(tmp_path):
+    early_out_of_window = date(2027, 1, 5)   # after the group's latest date
+    in_window = date(2026, 11, 20)
+    worker, store, client, account, by_id = _group_setup(
+        tmp_path,
+        days_by_member={
+            "111": [early_out_of_window, in_window],
+            "222": [early_out_of_window, in_window],
+        },
+        times_by_member_day={
+            (m, in_window): ["07:45", "08:00"] for m in ("111", "222")
+        },
+        min_slots=2,
+    )
+    worker._sweep_group(account, client, account.groups[0], by_id)
+    assert {s.day for s in client.booked} == {in_window}
+
+
+def test_group_skips_already_booked_members(tmp_path):
+    day = date(2026, 10, 10)
+    worker, store, client, account, by_id = _group_setup(
+        tmp_path,
+        days_by_member={"111": [day], "222": [day]},
+        times_by_member_day={(m, day): ["07:45", "08:00"] for m in ("111", "222")},
+    )
+    worker._booked["111"] = True
+    worker._sweep_group(account, client, account.groups[0], by_id)
+    # Fewer than 2 unbooked members left -- group logic must not act at all.
+    assert client.booked == []

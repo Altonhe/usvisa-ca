@@ -249,3 +249,89 @@ def test_example_config_declares_no_env_placeholders():
         if not line.strip().startswith("#")
     )
     assert "${" not in body
+
+
+
+# ---------------------------------------------------------------------------
+# Groups: a joint "must land on the same day" constraint across applications
+# ---------------------------------------------------------------------------
+
+GROUP_BASE = """
+defaults:
+  consulates: [TRT]
+  latest_acceptable_date: 2026-12-31
+accounts:
+  - name: Primary
+    email: a@example.com
+    password: secret
+    applications:
+      - schedule_id: "111"
+        label: A
+      - schedule_id: "222"
+        label: B
+    groups:
+      - members: ["111", "222"]
+        consulates: [MTL]
+        latest_acceptable_date: 2026-12-31
+        min_slots: 2
+"""
+
+
+def test_group_parses_members_and_consulates(tmp_path):
+    cfg = load_config(write(tmp_path, GROUP_BASE))
+    acc = cfg.accounts[0]
+    assert len(acc.groups) == 1
+    group = acc.groups[0]
+    assert group.members == ["111", "222"]
+    assert group.consulates == [91]  # MTL
+    assert group.min_slots == 2
+    assert group.target.latest == date(2026, 12, 31)
+    # Members keep their own independent TRT target, untouched by the group.
+    assert acc.applications[0].target.consulates == [94]
+    assert acc.applications[1].target.consulates == [94]
+
+
+def test_group_min_slots_defaults_to_two(tmp_path):
+    text = GROUP_BASE.replace("        min_slots: 2\n", "")
+    cfg = load_config(write(tmp_path, text))
+    assert cfg.accounts[0].groups[0].min_slots == 2
+
+
+def test_group_requires_at_least_two_members(tmp_path):
+    text = GROUP_BASE.replace('members: ["111", "222"]', 'members: ["111"]')
+    with pytest.raises(ConfigError, match="at least 2"):
+        load_config(write(tmp_path, text))
+
+
+def test_group_rejects_unknown_member(tmp_path):
+    text = GROUP_BASE.replace('members: ["111", "222"]', 'members: ["111", "999"]')
+    with pytest.raises(ConfigError, match="999"):
+        load_config(write(tmp_path, text))
+
+
+def test_group_rejects_duplicate_member(tmp_path):
+    text = GROUP_BASE.replace('members: ["111", "222"]', 'members: ["111", "111"]')
+    with pytest.raises(ConfigError, match="twice"):
+        load_config(write(tmp_path, text))
+
+
+def test_group_requires_consulates(tmp_path):
+    text = GROUP_BASE.replace("        consulates: [MTL]\n", "")
+    with pytest.raises(ConfigError, match="consulates"):
+        load_config(write(tmp_path, text))
+
+
+def test_group_consulate_clash_with_member_own_target_is_rejected(tmp_path):
+    """A member cannot watch the same consulate both on its own and via a group."""
+    text = GROUP_BASE.replace(
+        '      - schedule_id: "111"\n        label: A\n',
+        '      - schedule_id: "111"\n        label: A\n        consulates: [TRT, MTL]\n',
+    )
+    with pytest.raises(ConfigError, match="Montreal"):
+        load_config(write(tmp_path, text))
+
+
+def test_group_min_slots_must_be_positive(tmp_path):
+    text = GROUP_BASE.replace("min_slots: 2", "min_slots: 0")
+    with pytest.raises(ConfigError, match="min_slots"):
+        load_config(write(tmp_path, text))

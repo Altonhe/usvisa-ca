@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import threading
 import traceback
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -25,7 +26,7 @@ from .ais_client import (AisClient, AisError, LoginFailed, Schedule,
                          SessionExpired, Slot, TransientNetworkError,
                          parse_site_date)
 from .capsolver import CapSolver, CapSolverError
-from .config import Account, Application, Config, Target
+from .config import Account, Application, Config, Group, Target
 from .consulates import consulate_name
 from .metrics import collect
 from .newrelic import NewRelicClient
@@ -84,9 +85,17 @@ class Worker:
         for account in self.config.accounts:
             self.store.register_account(account.name, account.email)
             self.store.set_pending_discovery(account.name, account.auto_discover)
+            group_consulates = self._group_consulates_by_member(account)
             for app in account.applications:
+                display_target = app.target
+                extra = group_consulates.get(app.schedule_id)
+                if extra:
+                    display_target = replace(
+                        app.target,
+                        consulates=list(app.target.consulates) + extra,
+                    )
                 status = self.store.register_application(
-                    account.name, app.schedule_id, app.label, app.target
+                    account.name, app.schedule_id, app.label, display_target
                 )
                 if status.last_checked is None:
                     self.store.update_application(
@@ -100,6 +109,16 @@ class Worker:
                 self.store.prune_applications(
                     account.name, [a.schedule_id for a in account.applications]
                 )
+
+    @staticmethod
+    def _group_consulates_by_member(account: Account) -> Dict[str, List[int]]:
+        """schedule_id -> consulates it watches via a group, for display only."""
+        out: Dict[str, List[int]] = {}
+        for group in account.groups:
+            for member in group.members:
+                out.setdefault(member, []).extend(group.consulates)
+        return out
+
 
     def stop(self, timeout: float = 10.0) -> None:
         self._stop.set()
@@ -288,6 +307,12 @@ class Worker:
             self.log(f"[{account.name}] nothing actionable on this account")
             return
 
+        by_id = {app.schedule_id: (app, sched) for app, sched in applications}
+        for group in account.groups:
+            if self._stop.is_set():
+                return
+            self._sweep_group(account, client, group, by_id)
+
         checked: List[str] = []
         for app, schedule in applications:
             if self._stop.is_set():
@@ -343,8 +368,14 @@ class Worker:
         keep: List[str] = [a.schedule_id for a in account.applications]
         actionable: List[Tuple[Application, Schedule]] = []
         for app, sched in pairs:
+            display_target = app.target
+            extra = self._group_consulates_by_member(account).get(app.schedule_id)
+            if extra:
+                display_target = replace(
+                    app.target, consulates=list(app.target.consulates) + extra
+                )
             status = self.store.register_application(
-                account.name, app.schedule_id, app.label, app.target
+                account.name, app.schedule_id, app.label, display_target
             )
             if app.schedule_id not in keep:
                 keep.append(app.schedule_id)
@@ -366,6 +397,122 @@ class Worker:
                 )
         self.store.prune_applications(account.name, keep)
         return actionable
+
+    # -- per group ---------------------------------------------------------
+
+    def _sweep_group(
+        self,
+        account: Account,
+        client: AisClient,
+        group: Group,
+        by_id: Dict[str, Tuple[Application, Schedule]],
+    ) -> None:
+        """Find a day that works for every member of ``group`` at once.
+
+        Each member's /days.json is fetched independently, then intersected:
+        a day only counts if every member's application can be scheduled on
+        it. The earliest such day is then checked for total time-slot
+        capacity across all members (/times.json, one call per member) --
+        booking only proceeds once that total reaches ``group.min_slots``,
+        since with fewer slots than members some of them would inevitably
+        lose the race to each other or to an outside applicant.
+        """
+        members = [m for m in group.members if not self._booked.get(m)]
+        if len(members) < 2:
+            return  # already settled (or down to one member left to book alone)
+
+        label = ", ".join(by_id[m][0].display_name for m in members if m in by_id)
+        for facility_id in group.consulates:
+            if self._stop.is_set():
+                return
+            self._sweep_group_facility(account, client, group, members, by_id, facility_id, label)
+
+    def _sweep_group_facility(
+        self,
+        account: Account,
+        client: AisClient,
+        group: Group,
+        members: List[str],
+        by_id: Dict[str, Tuple[Application, Schedule]],
+        facility_id: int,
+        label: str,
+    ) -> None:
+        per_member_days: Dict[str, List[date]] = {}
+        for member in members:
+            if self._stop.is_set():
+                return
+            days = client.get_available_days(member, facility_id)
+            status = ConsulateStatus(facility_id=facility_id)
+            if days is None:
+                status.error = "request failed"
+            elif days:
+                status.total_days = len(days)
+                status.earliest = days[0]
+            self.store.update_consulate(account.name, member, status)
+            per_member_days[member] = days or []
+            if self._stop.wait(self.config.consulate_poll_delay):
+                return
+
+        common = sorted(set.intersection(*(set(d) for d in per_member_days.values())))
+        common = [d for d in common if group.target.accepts(d)]
+
+        self.log(
+            f"[{account.name}] group ({label}) {consulate_name(facility_id)}: "
+            f"{len(common)} common acceptable day(s)"
+            + (f", earliest {common[0]}" if common else "")
+        )
+        for member in members:
+            self.store.update_application(
+                account.name,
+                member,
+                message=(
+                    ""
+                    if common
+                    else f"group: no common day yet at {consulate_name(facility_id)}"
+                ),
+            )
+        if not common:
+            return
+
+        day = common[0]
+        per_member_times: Dict[str, List[str]] = {}
+        for member in members:
+            if self._stop.is_set():
+                return
+            times = client.get_available_times(member, facility_id, day)
+            per_member_times[member] = times or []
+
+        total_slots = sum(len(t) for t in per_member_times.values())
+        if total_slots < group.min_slots or any(not t for t in per_member_times.values()):
+            self.log(
+                f"[{account.name}] group ({label}) {consulate_name(facility_id)} "
+                f"@ {day}: only {total_slots} time slot(s) between them, need "
+                f"{group.min_slots}; waiting for more capacity"
+            )
+            for member in members:
+                self.store.update_application(
+                    account.name,
+                    member,
+                    message=(
+                        f"group: {day} at {consulate_name(facility_id)} has only "
+                        f"{total_slots} slot(s), waiting for {group.min_slots}"
+                    ),
+                )
+            return
+
+        # Enough capacity: give each member a distinct time so their booking
+        # requests do not collide on the exact same slot.
+        pool = sorted({t for times in per_member_times.values() for t in times})
+        self.log(
+            f"[{account.name}] group ({label}) MATCH {consulate_name(facility_id)} "
+            f"@ {day} ({total_slots} slot(s) available)"
+        )
+        for i, member in enumerate(members):
+            app, _ = by_id[member]
+            candidate_times = per_member_times[member] or pool
+            time_value = candidate_times[min(i, len(candidate_times) - 1)]
+            slot = Slot(member, facility_id, day, time=time_value)
+            self._attempt_booking(account, client, app, slot)
 
     # -- per application -------------------------------------------------
 

@@ -118,6 +118,23 @@ accounts:
         label: Applicant B
         # inherits consulates and dates from the account / defaults
 
+    # Optional: a joint constraint across two or more of the applications
+    # above. Unlike the per-application consulates, a group is not satisfied
+    # by each member finding its own best day -- every member must land on
+    # the *same* day, and only once that day has enough capacity for all of
+    # them (min_slots, summed across their /times.json results). Below that
+    # threshold the day is left for the next sweep instead of racing members
+    # against each other for the last slot.
+    #
+    # A consulate listed in a group must NOT also appear in a member's own
+    # `consulates` list above -- the group takes over that consulate
+    # entirely for its members.
+    # groups:
+    #   - members: ["72856817", "72856546"]
+    #     consulates: [MTL]
+    #     latest_acceptable_date: 2026-12-31
+    #     min_slots: 2
+
   # Add as many accounts as you like; the dashboard counts and groups them.
   # - name: Secondary
   #   email: other@example.com
