@@ -108,7 +108,11 @@ class TelegramNotifier:
         window: str,
         booking: bool,
     ) -> None:
-        action = "booking now" if booking else "test mode, not booking"
+        action = (
+            "booking attempted, did not go through; will retry"
+            if booking
+            else "test mode, not booking"
+        )
         self.send(
             "<b>Slot found</b>\n"
             f"Account: {html.escape(account)}\n"

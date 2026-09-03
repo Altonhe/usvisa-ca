@@ -560,11 +560,24 @@ class AisClient:
         resp = self._post_form(target.action, payload, page)
         return Page(resp.text, base_url=resp.url)
 
-    def book(self, slot: Slot, dry_run: bool = True) -> bool:
+    def book(
+        self,
+        slot: Slot,
+        dry_run: bool = True,
+        retry_attempts: int = 1,
+        retry_delay: float = 0.0,
+    ) -> bool:
         """Submit the appointment form for ``slot``.
 
         With ``dry_run`` the request is fully assembled and logged but never
         sent, which is what ``test_mode`` uses.
+
+        ``/days.json`` can list a day that ``/times.json`` then reports as
+        empty a few seconds later -- someone else took the last slot in the
+        gap between the two requests. When ``slot.time`` is not already
+        known, ``retry_attempts`` short, in-place re-checks of ``/times.json``
+        are made (spaced ``retry_delay`` seconds apart) before giving up,
+        instead of abandoning the match until the next full poll_interval.
         """
         page = self.open_appointment_page(slot.schedule_id)
         form = page.form_by_id("appointment-form")
@@ -578,7 +591,18 @@ class AisClient:
         payload[DATE_KEY] = slot.day.isoformat()
 
         if not slot.time:
-            times = self.get_available_times(slot.schedule_id, slot.facility_id, slot.day)
+            times: Optional[List[str]] = None
+            for attempt in range(1, max(1, retry_attempts) + 1):
+                times = self.get_available_times(slot.schedule_id, slot.facility_id, slot.day)
+                if times:
+                    break
+                if attempt < retry_attempts:
+                    self._log(
+                        f"no time slots on {slot.day} at {slot.consulate} yet "
+                        f"(attempt {attempt}/{retry_attempts}), retrying in "
+                        f"{retry_delay}s"
+                    )
+                    time.sleep(retry_delay)
             if not times:
                 self._log(f"no time slots left on {slot.day} at {slot.consulate}")
                 return False

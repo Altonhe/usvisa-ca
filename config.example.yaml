@@ -20,6 +20,14 @@ test_mode: true
 # (application x consulate). Going below ~180 is asking to be rate limited.
 poll_interval: 300
 
+# A day can show as available in /days.json and then be empty in /times.json
+# a few seconds later -- someone else took the last slot in between. On a
+# match, book() re-checks /times.json this many times, waiting
+# booking_retry_delay seconds between checks, before giving up on that day
+# until the next full sweep.
+booking_retry_attempts: 3
+booking_retry_delay: 2
+
 # Where the app keeps its JSON store (store.json is created inside).
 data_dir: data
 

@@ -443,14 +443,6 @@ class Worker:
 
         slot = self._pick(candidates, target)
         self.log(f"[{account.name}] {app.display_name}: MATCH {slot}")
-        self.notifier.slot_found(
-            account.name,
-            app.display_name,
-            slot.consulate,
-            slot.day,
-            target.describe_window(),
-            booking=not self.config.test_mode,
-        )
         self._attempt_booking(account, client, app, slot)
 
     @staticmethod
@@ -463,8 +455,17 @@ class Worker:
     def _attempt_booking(
         self, account: Account, client: AisClient, app: Application, slot: Slot
     ) -> None:
+        # Notified *after* the booking attempt, not before: the site can take
+        # the last slot on this day within seconds, so nothing should sit
+        # between the match and the booking request itself. The Telegram
+        # message still reports what was attempted, just a moment later.
         try:
-            ok = client.book(slot, dry_run=self.config.test_mode)
+            ok = client.book(
+                slot,
+                dry_run=self.config.test_mode,
+                retry_attempts=self.config.booking_retry_attempts,
+                retry_delay=self.config.booking_retry_delay,
+            )
         except AisError as exc:
             self.log(f"[{account.name}] booking failed: {exc}")
             self.store.update_application(
@@ -497,12 +498,28 @@ class Worker:
             )
             self.store.save()
         elif self.config.test_mode:
+            self.notifier.slot_found(
+                account.name,
+                app.display_name,
+                slot.consulate,
+                slot.day,
+                app.target.describe_window(),
+                booking=False,
+            )
             self.store.update_application(
                 account.name,
                 app.schedule_id,
                 message=f"test mode: would book {slot}",
             )
         else:
+            self.notifier.slot_found(
+                account.name,
+                app.display_name,
+                slot.consulate,
+                slot.day,
+                app.target.describe_window(),
+                booking=True,
+            )
             self.store.update_application(
                 account.name,
                 app.schedule_id,

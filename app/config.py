@@ -245,6 +245,12 @@ class Config:
     consulate_poll_delay: int = 2
     account_poll_delay: int = 10
     max_consecutive_failures: int = 5
+    # A day can show as available in /days.json and then be empty in
+    # /times.json a few seconds later -- someone else took the last slot in
+    # between. These retries buy back a few seconds of that race instead of
+    # giving up until the next full poll_interval.
+    booking_retry_attempts: int = 3
+    booking_retry_delay: float = 2.0
     data_dir: Path = Path("data")
     locale: str = "en-ca"
     user_agent: str = (
@@ -449,6 +455,12 @@ def load_config(path: Optional[Path] = None) -> Config:
         account_poll_delay=_as_int(raw.get("account_poll_delay"), 10, "account_poll_delay"),
         max_consecutive_failures=_as_int(
             raw.get("max_consecutive_failures"), 5, "max_consecutive_failures"
+        ),
+        booking_retry_attempts=_as_int(
+            raw.get("booking_retry_attempts"), 3, "booking_retry_attempts"
+        ),
+        booking_retry_delay=float(
+            _as_int(raw.get("booking_retry_delay"), 2, "booking_retry_delay")
         ),
         data_dir=Path(str(raw.get("data_dir") or "data")),
         locale=str(raw.get("locale") or "en-ca"),
