@@ -553,10 +553,19 @@ class Worker:
         common = sorted(set.intersection(*(set(d) for d in per_member_days.values())))
         common = [d for d in common if group.target.accepts(d)]
 
+        per_member_earliest = {
+            m: (min(days) if days else None) for m, days in per_member_days.items()
+        }
+        earliest_desc = ", ".join(
+            f"{(by_id[m][0].label or m)}: "
+            f"{per_member_earliest[m] if per_member_earliest[m] else 'none'}"
+            for m in members
+        )
         self.log(
             f"[{account.name}] group ({label}) {consulate_name(facility_id)}: "
             f"{len(common)} common acceptable day(s)"
             + (f", earliest {common[0]}" if common else "")
+            + f" | individually: {earliest_desc}"
         )
         for member in members:
             self.store.update_application(
