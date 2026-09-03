@@ -376,6 +376,8 @@ class Worker:
             resumed = client.resume_session()
             if not resumed:
                 self.log(f"[{account.name}] saved session is no longer valid, signing in")
+        else:
+            self.log(f"[{account.name}] no saved session found, signing in")
 
         if not resumed:
             client.login()
