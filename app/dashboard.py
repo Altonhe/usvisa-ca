@@ -65,6 +65,7 @@ def create_app(config: Config, store: Store, worker: Optional[Worker] = None) ->
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request, _: None = Depends(require_auth)):
+        worker_context = worker.dashboard_context() if worker else {"groups": [], "sessions": []}
         return templates.TemplateResponse(
             request,
             "dashboard.html",
@@ -75,6 +76,8 @@ def create_app(config: Config, store: Store, worker: Optional[Worker] = None) ->
                 "capsolver_enabled": config.capsolver_enabled,
                 "telegram_enabled": config.telegram.enabled,
                 "worker_running": bool(worker and worker.running),
+                "groups": worker_context["groups"],
+                "sessions": worker_context["sessions"],
             },
         )
 

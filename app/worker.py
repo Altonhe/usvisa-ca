@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import threading
 import traceback
+import re
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .ais_client import (AisClient, AisError, LoginFailed, Schedule,
@@ -28,7 +30,7 @@ from .ais_client import (AisClient, AisError, LoginFailed, Schedule,
 from .capsolver import CapSolver, CapSolverError
 from .config import Account, Application, Config, Group, Target
 from .consulates import consulate_name
-from .metrics import collect
+from .metrics import GroupRecord, collect, collect_groups
 from .newrelic import NewRelicClient
 from .notifier import TelegramNotifier
 from .store import ConsulateStatus, Store
@@ -53,6 +55,14 @@ class Worker:
         # schedule_id -> True once booked, so a restart or a later sweep does
         # not try to rebook something that is already settled.
         self._booked: Dict[str, bool] = {}
+        # Latest joint-availability check per (account, members, consulate),
+        # rebuilt every sweep and pushed to New Relic alongside the regular
+        # per-application metrics. Not persisted -- it is a live report, not
+        # history.
+        self._group_records: Dict[Tuple[str, str, int], GroupRecord] = {}
+        # account -> True if the current session was resumed from disk rather
+        # than signed in fresh this run. Dashboard-only diagnostic.
+        self._session_resumed: Dict[str, bool] = {}
 
     # -- logging ---------------------------------------------------------
 
@@ -129,6 +139,40 @@ class Worker:
     def running(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
+    def dashboard_context(self) -> Dict[str, object]:
+        """Extra, non-persisted state the dashboard shows alongside the store.
+
+        Group checks and session-resume status only make sense as "since this
+        process started" facts, so they live on the worker instead of the
+        store: restarting the process is exactly the event that resets them.
+        """
+        groups = [
+            {
+                "account": rec.account,
+                "members": rec.members,
+                "consulate": rec.consulate,
+                "common_days": rec.common_days,
+                "earliest_common": rec.earliest_common.isoformat() if rec.earliest_common else None,
+                "slots_found": rec.slots_found,
+                "min_slots": rec.min_slots,
+                "error": rec.error,
+                "ready": rec.ready,
+            }
+            for rec in sorted(
+                self._group_records.values(), key=lambda r: (r.account, r.members, r.consulate)
+            )
+        ]
+        sessions = []
+        for account in self.config.accounts:
+            path = self._session_path(account.name)
+            sessions.append({
+                "account": account.name,
+                "resumed": self._session_resumed.get(account.name, False),
+                "saved": path.exists(),
+                "path": str(path),
+            })
+        return {"groups": groups, "sessions": sessions}
+
     # -- main loop -------------------------------------------------------
 
     def _run(self) -> None:
@@ -192,6 +236,7 @@ class Worker:
             return
         try:
             samples = collect(self.store.snapshot())
+            samples += collect_groups(list(self._group_records.values()))
             self.newrelic.send(samples)
         except Exception as exc:  # noqa: BLE001 - metrics are never critical
             self.log(f"metrics push failed (ignored): {exc}")
@@ -229,6 +274,7 @@ class Worker:
                 # Expected periodically; not a failure worth counting or alerting.
                 self.log(f"[{account.name}] {exc}")
                 self._clients.pop(account.name, None)
+                self._discard_saved_session(account.name)
             except TransientNetworkError as exc:
                 # The network blipped, not the session. Keep the cookies and try
                 # again next sweep; a full traceback here is pure noise.
@@ -266,6 +312,7 @@ class Worker:
         self.store.set_account_error(account.name, reason)
         # Force a fresh session next sweep.
         self._clients.pop(account.name, None)
+        self._discard_saved_session(account.name)
         if count == self.config.max_consecutive_failures:
             self.notifier.account_error(
                 account.name,
@@ -273,8 +320,36 @@ class Worker:
                 f"{self.config.poll_interval}s",
             )
 
+    def _session_path(self, account_name: str) -> Path:
+        """Where this account's cookies + landing_url are persisted.
+
+        Kept next to store.json in the same data_dir/volume, so a container
+        restart can resume the session instead of always signing in fresh --
+        re-authenticating on every restart is unnecessary load on the site and
+        the pattern most likely to arm reCAPTCHA.
+        """
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", account_name).strip("_") or "account"
+        return self.config.data_dir / "sessions" / f"{safe}.json"
+
+    def _discard_saved_session(self, account_name: str) -> None:
+        """Remove a saved session known to be invalid.
+
+        Best-effort: leaving a stale file behind is harmless (the next
+        _client_for call will just find it does not resume and re-login), so
+        any error here is swallowed.
+        """
+        try:
+            self._session_path(account_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def _client_for(self, account: Account) -> AisClient:
-        """Reuse a logged-in session, creating one on demand."""
+        """Reuse a logged-in session, creating one on demand.
+
+        A brand-new client first tries to resume the session saved on disk
+        (survives a process/container restart) before falling back to a full
+        sign-in.
+        """
         client = self._clients.get(account.name)
         if client is not None:
             return client
@@ -295,7 +370,18 @@ class Worker:
             request_delay=self.config.consulate_poll_delay,
             logger=lambda m: self.log(f"[{account.name}] {m}"),
         )
-        client.login()
+        session_path = self._session_path(account.name)
+        resumed = False
+        if client.load_cookies(session_path):
+            resumed = client.resume_session()
+            if not resumed:
+                self.log(f"[{account.name}] saved session is no longer valid, signing in")
+
+        if not resumed:
+            client.login()
+
+        client.save_cookies(session_path)
+        self._session_resumed[account.name] = resumed
         self.store.mark_login(account.name)
         self._clients[account.name] = client
         return client
@@ -438,6 +524,7 @@ class Worker:
         label: str,
     ) -> None:
         per_member_days: Dict[str, List[date]] = {}
+        any_error = False
         for member in members:
             if self._stop.is_set():
                 return
@@ -445,6 +532,7 @@ class Worker:
             status = ConsulateStatus(facility_id=facility_id)
             if days is None:
                 status.error = "request failed"
+                any_error = True
             elif days:
                 status.total_days = len(days)
                 status.earliest = days[0]
@@ -452,6 +540,13 @@ class Worker:
             per_member_days[member] = days or []
             if self._stop.wait(self.config.consulate_poll_delay):
                 return
+
+        if any_error:
+            self._record_group_metric(
+                account, label, facility_id, group.min_slots,
+                common_days=0, earliest_common=None, slots_found=0, error="request failed",
+            )
+            return
 
         common = sorted(set.intersection(*(set(d) for d in per_member_days.values())))
         common = [d for d in common if group.target.accepts(d)]
@@ -472,6 +567,10 @@ class Worker:
                 ),
             )
         if not common:
+            self._record_group_metric(
+                account, label, facility_id, group.min_slots,
+                common_days=0, earliest_common=None, slots_found=0,
+            )
             return
 
         day = common[0]
@@ -483,6 +582,10 @@ class Worker:
             per_member_times[member] = times or []
 
         total_slots = sum(len(t) for t in per_member_times.values())
+        self._record_group_metric(
+            account, label, facility_id, group.min_slots,
+            common_days=len(common), earliest_common=day, slots_found=total_slots,
+        )
         if total_slots < group.min_slots or any(not t for t in per_member_times.values()):
             self.log(
                 f"[{account.name}] group ({label}) {consulate_name(facility_id)} "
@@ -513,6 +616,35 @@ class Worker:
             time_value = candidate_times[min(i, len(candidate_times) - 1)]
             slot = Slot(member, facility_id, day, time=time_value)
             self._attempt_booking(account, client, app, slot)
+
+    def _record_group_metric(
+        self,
+        account: Account,
+        label: str,
+        facility_id: int,
+        min_slots: int,
+        common_days: int,
+        earliest_common: Optional[date],
+        slots_found: int,
+        error: str = "",
+    ) -> None:
+        """Remember the latest joint-availability check for _emit_metrics.
+
+        Keyed on (account, members, consulate) so a later sweep overwrites the
+        previous check for the same group rather than accumulating history --
+        this is a live snapshot, not a series.
+        """
+        key = (account.name, label, facility_id)
+        self._group_records[key] = GroupRecord(
+            account=account.name,
+            members=label,
+            consulate=consulate_name(facility_id),
+            common_days=common_days,
+            earliest_common=earliest_common,
+            slots_found=slots_found,
+            min_slots=min_slots,
+            error=error,
+        )
 
     # -- per application -------------------------------------------------
 

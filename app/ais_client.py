@@ -30,7 +30,8 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Union
 
 import requests
 
@@ -381,6 +382,66 @@ class AisClient:
         except requests.RequestException:
             return False
         return "/niv/groups/" in resp.url
+
+    def resume_session(self) -> bool:
+        """Try to pick up where a previous process's cookies left off.
+
+        Unlike :meth:`login`, this never raises: failing to resume just means
+        the caller should fall back to a normal sign-in. On success
+        ``landing_url`` is set exactly as :meth:`_confirm_session` would.
+        """
+        try:
+            resp = self.session.get(
+                self.account_home_url, timeout=self.timeout, allow_redirects=True
+            )
+        except requests.RequestException as exc:
+            self._log(f"could not verify the saved session: {exc}")
+            return False
+        landed = Page(resp.text, base_url=resp.url)
+        if "/niv/groups/" in resp.url and not landed.form_by_id("sign_in_form"):
+            self.landing_url = resp.url
+            self._log(f"resumed saved session, landed on {resp.url}")
+            return True
+        return False
+
+    def save_cookies(self, path: Union[str, Path]) -> None:
+        """Persist cookies + ``landing_url`` so a restart can skip signing in.
+
+        Best-effort: a write failure is logged and swallowed, never raised,
+        since losing the saved session just means the next process signs in
+        fresh -- exactly what happens today.
+        """
+        path = Path(path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "cookies": requests.utils.dict_from_cookiejar(self.session.cookies),
+                "landing_url": self.landing_url,
+            }
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            self._log(f"could not save session cookies: {exc}")
+
+    def load_cookies(self, path: Union[str, Path]) -> bool:
+        """Load a previously saved session. Returns False if none was usable."""
+        path = Path(path)
+        if not path.exists():
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            cookies = payload.get("cookies") or {}
+            if not cookies:
+                return False
+            self.session.cookies.update(
+                requests.utils.cookiejar_from_dict(cookies)
+            )
+            self.landing_url = payload.get("landing_url") or ""
+            return True
+        except (OSError, ValueError, KeyError, AttributeError) as exc:
+            self._log(f"ignoring unreadable saved session {path}: {exc}")
+            return False
 
     @staticmethod
     def _login_error_reason(page: Page) -> str:

@@ -77,6 +77,34 @@
   }
   .log pre { margin: 0; font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; color: var(--muted); white-space: pre-wrap; }
   a { color: var(--info); }
+
+  /* Joint constraints (groups) */
+  .group-table { margin: 0; }
+  .pill.ready   { background: rgba(63,185,80,.16);  color: var(--ok); }
+  .pill.waiting { background: rgba(210,153,34,.16); color: var(--warn); }
+  .pill.none    { background: rgba(154,163,178,.14); color: var(--muted); }
+  .bar {
+    display: inline-block; width: 72px; height: 6px; border-radius: 4px;
+    background: var(--line); overflow: hidden; vertical-align: middle; margin-right: 6px;
+  }
+  .bar > span { display: block; height: 100%; background: var(--info); }
+  .bar.full > span { background: var(--ok); }
+  .slot-count { font-size: 12px; color: var(--muted); vertical-align: middle; }
+  .group-note {
+    padding: 10px 16px; font-size: 12px; color: var(--muted);
+    border-top: 1px solid var(--line); background: rgba(88,166,255,.05);
+  }
+
+  /* Sessions */
+  .session-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+  .session-card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 14px; font-size: 12px; min-width: 200px;
+  }
+  .session-card .acc { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; }
+  .dot.on { background: var(--ok); }
+  .dot.off { background: var(--muted); }
 </style>
 </head>
 <body>
@@ -136,6 +164,13 @@
       </div>
       <div class="l">CapSolver / Telegram</div>
     </div>
+    <div class="card">
+      <div class="n" style="font-size:15px;padding-top:7px">
+        {% set resumed_count = sessions | selectattr('resumed') | list | length %}
+        {{ resumed_count }} / {{ sessions | length }}
+      </div>
+      <div class="l">Sessions resumed</div>
+    </div>
   </div>
 
   {% if not data.accounts %}
@@ -165,6 +200,53 @@
       {% endif %}
     </div>
     {% else %}
+
+    {% set account_groups = groups | selectattr('account', 'equalto', account.name) | list %}
+    {% if account_groups %}
+    <table class="group-table">
+      <thead>
+        <tr>
+          <th>Joint constraint</th>
+          <th>Consulate</th>
+          <th>Common day</th>
+          <th>Slots</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for g in account_groups %}
+        <tr>
+          <td>{{ g.members }}</td>
+          <td>{{ g.consulate }}</td>
+          <td>
+            {% if g.error %}<span class="v-error">request failed</span>
+            {% elif g.earliest_common %}{{ g.earliest_common }}
+            {% else %}<span class="v-none">no common day yet</span>{% endif %}
+          </td>
+          <td>
+            {% if g.earliest_common and not g.error %}
+              {% set pct = ((g.slots_found / g.min_slots) * 100) | round(0, 'floor') if g.min_slots else 100 %}
+              <span class="bar{{ ' full' if g.ready else '' }}"><span style="width:{{ [pct, 100] | min }}%"></span></span>
+              <span class="slot-count">{{ g.slots_found }} / {{ g.min_slots }} needed</span>
+            {% else %}<span class="v-none">&mdash;</span>{% endif %}
+          </td>
+          <td>
+            {% if g.error %}<span class="pill error">error</span>
+            {% elif g.ready %}<span class="pill ready">ready to book</span>
+            {% elif g.earliest_common %}<span class="pill waiting">waiting for capacity</span>
+            {% else %}<span class="pill none">watching</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="group-note">
+      A joint constraint books every member together on the earliest day they
+      can all attend, once that day has enough time slots for all of them.
+      Its consulate is not polled independently by the members below.
+    </div>
+    {% endif %}
+
     <table>
       <thead>
         <tr>
@@ -219,10 +301,13 @@
           </td>
           <td>
             <div class="cons">
+            {% set group_consulates = account_groups | map(attribute='consulate') | list %}
             {% for c in app.consulates %}
               <div>
                 <span class="name">{{ c.name }}</span>
-                {% if c.status == 'error' %}<span class="v-error">request failed</span>
+                {% if c.name in group_consulates %}
+                  <span class="kind">(joint, see above)</span>
+                {% elif c.status == 'error' %}<span class="v-error">request failed</span>
                 {% elif c.status == 'none' %}<span class="v-none">no availability</span>
                 {% elif c.status == 'match' %}<span class="v-match">{{ c.earliest_acceptable }}</span>
                   <span class="kind">({{ c.acceptable_count }} of {{ c.total_days }} ok)</span>
@@ -246,6 +331,22 @@
     {% endif %}
   </section>
   {% endfor %}
+
+  {% if sessions %}
+  <h1 style="font-size:14px;margin:24px 0 10px">Sessions</h1>
+  <div class="session-grid">
+    {% for s in sessions %}
+    <div class="session-card">
+      <div class="acc">{{ s.account }}</div>
+      <div><span class="dot {{ 'on' if s.resumed else 'off' }}"></span>
+        {{ 'resumed from disk' if s.resumed else 'signed in fresh' }}</div>
+      <div class="kind" style="margin-top:4px">
+        {{ 'session file saved' if s.saved else 'no saved session yet' }}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
 
   <h1 style="font-size:14px;margin:24px 0 10px">Recent activity</h1>
   <div class="log">

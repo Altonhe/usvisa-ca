@@ -205,6 +205,23 @@ e-mail addresses are stored masked.
 Mount it on a volume (Compose does this as `watcher-data`) to keep it across
 container replacements. Deleting it is safe — you only lose history.
 
+## Session persistence
+
+Each account's cookies and `landing_url` are saved to
+`data/sessions/<account>.json` right after signing in, on the same
+`watcher-data` volume as the store. On the next start (a redeploy, a crash
+recovery, `docker compose restart`) the watcher tries that saved session
+first — one cheap `GET /niv` to check it still lands on `/niv/groups/{id}` —
+before falling back to a full sign-in. This is what keeps a routine restart
+from generating an extra login every time: re-authenticating is the pattern
+most likely to arm reCAPTCHA, so it is avoided whenever the old session is
+still good.
+
+A session that turns out to be expired, or a login/session error, deletes the
+saved file so the next attempt does a clean sign-in rather than repeatedly
+probing dead cookies. Deleting `data/sessions/` by hand is always safe — the
+next sweep just signs in fresh, exactly like a first run.
+
 ## Metrics
 
 Metrics are pushed to **New Relic** after every sweep — a single HTTPS POST to the

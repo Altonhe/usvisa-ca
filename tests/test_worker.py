@@ -206,6 +206,15 @@ class FakeClient:
     def login(self):
         FakeClient.logins += 1
 
+    def load_cookies(self, path):
+        return False
+
+    def resume_session(self):
+        return False
+
+    def save_cookies(self, path):
+        pass
+
     def discover_schedules(self, only_ids=None):
         return [Schedule(id="111", action_label="Schedule Appointment",
                          continue_url="/en-ca/niv/schedule/111/continue")]
@@ -594,3 +603,133 @@ def test_group_skips_already_booked_members(tmp_path):
     worker._sweep_group(account, client, account.groups[0], by_id)
     # Fewer than 2 unbooked members left -- group logic must not act at all.
     assert client.booked == []
+
+
+
+# ---------------------------------------------------------------------------
+# Session persistence: a restart should resume rather than always re-login
+# ---------------------------------------------------------------------------
+
+class SessionAwareClient(FakeClient):
+    """Tracks resume/save calls in addition to what FakeClient already counts."""
+
+    resumable = False   # class-level: whether resume_session() should succeed
+    resumes = 0
+    saves = 0
+
+    def load_cookies(self, path):
+        return path.exists()
+
+    def resume_session(self):
+        SessionAwareClient.resumes += 1
+        return SessionAwareClient.resumable
+
+    def save_cookies(self, path):
+        SessionAwareClient.saves += 1
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+
+
+def test_client_for_signs_in_and_saves_session_when_none_exists(tmp_path, monkeypatch):
+    from app.config import Account
+
+    FakeClient.logins = 0
+    SessionAwareClient.resumes = 0
+    SessionAwareClient.saves = 0
+    SessionAwareClient.resumable = False
+    monkeypatch.setattr("app.worker.AisClient", SessionAwareClient)
+
+    worker, store = build_worker(tmp_path)
+    account = Account(name="A", email="a@example.com", password="p",
+                       target=make_target(consulates=[94]))
+    worker.config.accounts = [account]
+
+    client = worker._client_for(account)
+
+    assert FakeClient.logins == 1          # no saved session -> normal sign-in
+    assert SessionAwareClient.resumes == 0  # nothing to resume
+    assert SessionAwareClient.saves == 1    # the fresh session gets persisted
+    assert worker._session_path("A").exists()
+
+
+def test_client_for_resumes_a_valid_saved_session_without_logging_in(tmp_path, monkeypatch):
+    from app.config import Account
+
+    FakeClient.logins = 0
+    SessionAwareClient.resumes = 0
+    SessionAwareClient.saves = 0
+    SessionAwareClient.resumable = True
+    monkeypatch.setattr("app.worker.AisClient", SessionAwareClient)
+
+    worker, store = build_worker(tmp_path)
+    account = Account(name="A", email="a@example.com", password="p",
+                       target=make_target(consulates=[94]))
+    worker.config.accounts = [account]
+
+    # Pre-seed a saved session file, as a previous process would have left one.
+    session_path = worker._session_path("A")
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    session_path.write_text("{}", encoding="utf-8")
+
+    worker._client_for(account)
+
+    assert FakeClient.logins == 0           # resumed, never signed in
+    assert SessionAwareClient.resumes == 1
+
+
+def test_client_for_falls_back_to_login_when_saved_session_is_invalid(tmp_path, monkeypatch):
+    from app.config import Account
+
+    FakeClient.logins = 0
+    SessionAwareClient.resumes = 0
+    SessionAwareClient.saves = 0
+    SessionAwareClient.resumable = False   # saved cookies exist but are stale
+    monkeypatch.setattr("app.worker.AisClient", SessionAwareClient)
+
+    worker, store = build_worker(tmp_path)
+    account = Account(name="A", email="a@example.com", password="p",
+                       target=make_target(consulates=[94]))
+    worker.config.accounts = [account]
+
+    session_path = worker._session_path("A")
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    session_path.write_text("{}", encoding="utf-8")
+
+    worker._client_for(account)
+
+    assert SessionAwareClient.resumes == 1
+    assert FakeClient.logins == 1           # resume failed -> normal sign-in
+    assert SessionAwareClient.saves == 1    # the new session is saved again
+
+
+def test_account_failure_discards_the_saved_session(tmp_path, monkeypatch):
+    from app.config import Account
+    from app.ais_client import AisError
+
+    class Failing(FakeClient):
+        def discover_schedules(self, only_ids=None):
+            raise AisError("boom")
+
+    FakeClient.logins = 0
+    monkeypatch.setattr("app.worker.AisClient", Failing)
+
+    worker, store = build_worker(tmp_path)
+    account = Account(name="A", email="a@example.com", password="p",
+                       target=make_target(consulates=[94]))
+    worker.config.accounts = [account]
+
+    session_path = worker._session_path("A")
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    session_path.write_text("{}", encoding="utf-8")
+
+    worker._sweep()
+
+    assert not session_path.exists()
+
+
+def test_session_path_is_filesystem_safe_for_odd_account_names(tmp_path):
+    worker, _ = build_worker(tmp_path)
+    path = worker._session_path("Weird / Name!! (test)")
+    assert path.parent.name == "sessions"
+    assert " " not in path.name
+    assert "/" not in path.name

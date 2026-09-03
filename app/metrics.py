@@ -169,6 +169,83 @@ def collect(snapshot: Dict[str, Any], today: Optional[date] = None) -> List[Samp
 
 
 # ---------------------------------------------------------------------------
+# Groups: joint "must land on the same day" constraints
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GroupRecord:
+    """One /days.json + /times.json check for a group at one consulate.
+
+    Built by the worker after each ``_sweep_group_facility`` call and handed
+    to :func:`collect_groups`. Not persisted in the store -- this is a report
+    of the last check only, meant to answer "how close is this joint
+    constraint to being satisfiable" on the dashboard.
+    """
+
+    account: str
+    members: str            # display labels, joined with " + "
+    consulate: str
+    common_days: int
+    earliest_common: Optional[date]
+    slots_found: int
+    min_slots: int
+    error: str = ""
+
+    @property
+    def ready(self) -> bool:
+        return not self.error and self.common_days > 0 and self.slots_found >= self.min_slots
+
+
+def collect_groups(
+    records: List[GroupRecord], today: Optional[date] = None
+) -> List[Sample]:
+    """Turn the latest group checks into gauge samples.
+
+    Mirrors the per-consulate samples in :func:`collect`, but keyed on the
+    joint constraint (``members``, ``consulate``) rather than a single
+    application, since a group's availability only means something once every
+    member is accounted for.
+    """
+    today = today or datetime.now(timezone.utc).date()
+    out: List[Sample] = []
+
+    def add(name: str, value: Any, help_text: str, **attrs: Any) -> None:
+        out.append(Sample(
+            name=name,
+            value=float(value),
+            help=help_text,
+            attributes={k: v for k, v in attrs.items() if v not in (None, "")},
+        ))
+
+    for rec in records:
+        loc = dict(account=rec.account, members=rec.members, consulate=rec.consulate)
+
+        add("group_poll_ok", not rec.error,
+            "1 when the last joint availability check succeeded.", **loc)
+        if rec.error:
+            continue
+
+        add("group_common_days", rec.common_days,
+            "Days every member of this group can attend, at the last check.",
+            **loc)
+        add("group_slots_found", rec.slots_found,
+            "Total distinct time slots found on the earliest common day.",
+            **loc)
+        add("group_min_slots", rec.min_slots,
+            "Slots required before the group books; from config.", **loc)
+        add("group_ready", rec.ready,
+            "1 when the earliest common day has enough slots to book "
+            "every member.", **loc)
+
+        if rec.earliest_common:
+            add("group_earliest_common_days", (rec.earliest_common - today).days,
+                "Days from today to the earliest day every member of this "
+                "group can attend.", **loc)
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # New Relic Metric API
 # ---------------------------------------------------------------------------
 

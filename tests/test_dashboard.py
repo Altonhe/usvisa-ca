@@ -316,3 +316,135 @@ def test_example_config_drives_dashboard(tmp_path):
     assert r.status_code == 200
     assert "72856817" in r.text
     assert "Toronto" in r.text
+
+
+
+# ---------------------------------------------------------------------------
+# Joint constraints (groups) and session diagnostics
+# ---------------------------------------------------------------------------
+
+def test_dashboard_context_shapes_group_records(tmp_path):
+    from app.notifier import TelegramNotifier
+    from app.worker import Worker
+    from app.metrics import GroupRecord
+    from app.config import Config, Account, TelegramConfig as TG
+
+    config = Config(accounts=[Account(name="Primary", email="a@example.com", password="p")],
+                     telegram=TG(), data_dir=tmp_path)
+    store = Store(path=config.store_file)
+    worker = Worker(config, store, TelegramNotifier(config.telegram, logger=lambda m: None))
+
+    worker._group_records[("Primary", "Alice + Bob", 91)] = GroupRecord(
+        account="Primary", members="Alice + Bob", consulate="Montreal",
+        common_days=2, earliest_common=date(2026, 10, 10),
+        slots_found=1, min_slots=2,
+    )
+    ctx = worker.dashboard_context()
+    assert len(ctx["groups"]) == 1
+    g = ctx["groups"][0]
+    assert g["members"] == "Alice + Bob"
+    assert g["consulate"] == "Montreal"
+    assert g["earliest_common"] == "2026-10-10"
+    assert g["ready"] is False   # 1 < 2 min_slots
+
+    assert len(ctx["sessions"]) == 1
+    assert ctx["sessions"][0]["account"] == "Primary"
+    assert ctx["sessions"][0]["resumed"] is False
+    assert ctx["sessions"][0]["saved"] is False
+
+
+def test_dashboard_renders_joint_constraint_section(populated_store):
+    from app.notifier import TelegramNotifier
+    from app.worker import Worker
+    from app.metrics import GroupRecord
+    from app.config import Config as Cfg, Account, TelegramConfig as TG, DashboardConfig as DC
+
+    config = Cfg(
+        accounts=[Account(name="Primary", email="a@example.com", password="p")],
+        telegram=TG(),
+        dashboard=DC(username="admin", password="hunter2"),
+    )
+    worker = Worker(config, populated_store, TelegramNotifier(config.telegram, logger=lambda m: None))
+    worker._group_records[("Primary", "Applicant A + Applicant B", 91)] = GroupRecord(
+        account="Primary", members="Applicant A + Applicant B", consulate="Montreal",
+        common_days=3, earliest_common=date(2026, 11, 5),
+        slots_found=2, min_slots=2,
+    )
+    client = TestClient(create_app(config, populated_store, worker))
+    r = client.get("/", auth=("admin", "hunter2"))
+    assert r.status_code == 200
+    body = r.text
+    assert "Joint constraint" in body
+    assert "Applicant A + Applicant B" in body
+    assert "Montreal" in body
+    assert "2026-11-05" in body
+    assert "ready to book" in body
+
+
+def test_dashboard_renders_waiting_group_state(populated_store):
+    from app.notifier import TelegramNotifier
+    from app.worker import Worker
+    from app.metrics import GroupRecord
+    from app.config import Config as Cfg, Account, TelegramConfig as TG, DashboardConfig as DC
+
+    config = Cfg(
+        accounts=[Account(name="Primary", email="a@example.com", password="p")],
+        telegram=TG(),
+        dashboard=DC(username="admin", password="hunter2"),
+    )
+    worker = Worker(config, populated_store, TelegramNotifier(config.telegram, logger=lambda m: None))
+    worker._group_records[("Primary", "Applicant A + Applicant B", 91)] = GroupRecord(
+        account="Primary", members="Applicant A + Applicant B", consulate="Montreal",
+        common_days=1, earliest_common=date(2026, 11, 5),
+        slots_found=1, min_slots=2,
+    )
+    client = TestClient(create_app(config, populated_store, worker))
+    body = client.get("/", auth=("admin", "hunter2")).text
+    assert "waiting for capacity" in body
+    assert "1 / 2 needed" in body
+
+
+def test_dashboard_renders_no_common_day_group_state(populated_store):
+    from app.notifier import TelegramNotifier
+    from app.worker import Worker
+    from app.metrics import GroupRecord
+    from app.config import Config as Cfg, Account, TelegramConfig as TG, DashboardConfig as DC
+
+    config = Cfg(
+        accounts=[Account(name="Primary", email="a@example.com", password="p")],
+        telegram=TG(),
+        dashboard=DC(username="admin", password="hunter2"),
+    )
+    worker = Worker(config, populated_store, TelegramNotifier(config.telegram, logger=lambda m: None))
+    worker._group_records[("Primary", "Applicant A + Applicant B", 91)] = GroupRecord(
+        account="Primary", members="Applicant A + Applicant B", consulate="Montreal",
+        common_days=0, earliest_common=None, slots_found=0, min_slots=2,
+    )
+    client = TestClient(create_app(config, populated_store, worker))
+    body = client.get("/", auth=("admin", "hunter2")).text
+    assert "no common day yet" in body
+
+
+def test_dashboard_renders_session_cards(populated_store):
+    from app.notifier import TelegramNotifier
+    from app.worker import Worker
+    from app.config import Config as Cfg, Account, TelegramConfig as TG, DashboardConfig as DC
+
+    config = Cfg(
+        accounts=[Account(name="Primary", email="a@example.com", password="p")],
+        telegram=TG(),
+        dashboard=DC(username="admin", password="hunter2"),
+    )
+    worker = Worker(config, populated_store, TelegramNotifier(config.telegram, logger=lambda m: None))
+    worker._session_resumed["Primary"] = True
+    client = TestClient(create_app(config, populated_store, worker))
+    body = client.get("/", auth=("admin", "hunter2")).text
+    assert "Sessions" in body
+    assert "resumed from disk" in body
+
+
+def test_dashboard_without_worker_omits_group_and_session_sections(populated_store):
+    client, _ = build(populated_store)
+    body = client.get("/").text
+    assert "<th>Joint constraint</th>" not in body
+    assert "<h1 style=\"font-size:14px;margin:24px 0 10px\">Sessions</h1>" not in body

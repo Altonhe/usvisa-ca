@@ -221,3 +221,83 @@ def test_metrics_follows_dashboard_auth(store):
     client = build(store, auth=True)
     assert client.get("/metrics").status_code == 401
     assert client.get("/metrics", auth=("admin", "hunter2")).status_code == 200
+
+
+
+# ---------------------------------------------------------------------------
+# Groups: joint "must land on the same day" constraint metrics
+# ---------------------------------------------------------------------------
+
+from app.metrics import GroupRecord, collect_groups, to_prometheus
+
+
+def _parse_samples(samples):
+    return {
+        (s.prometheus_name, frozenset(s.attributes.items())): s.value
+        for s in samples
+    }
+
+
+def test_group_ready_when_common_day_has_enough_slots():
+    rec = GroupRecord(
+        account="Primary", members="Alice + Bob", consulate="Montreal",
+        common_days=3, earliest_common=date(2026, 10, 10),
+        slots_found=2, min_slots=2,
+    )
+    samples = _parse_samples(collect_groups([rec], today=TODAY))
+    assert samples[("usvisa_group_ready", frozenset({("account", "Primary"),
+                    ("members", "Alice + Bob"), ("consulate", "Montreal")}))] == 1
+    assert samples[("usvisa_group_common_days", frozenset({("account", "Primary"),
+                    ("members", "Alice + Bob"), ("consulate", "Montreal")}))] == 3
+    days_out = (date(2026, 10, 10) - TODAY).days
+    assert samples[("usvisa_group_earliest_common_days", frozenset({
+        ("account", "Primary"), ("members", "Alice + Bob"), ("consulate", "Montreal"),
+    }))] == days_out
+
+
+def test_group_not_ready_when_slots_are_short():
+    rec = GroupRecord(
+        account="Primary", members="Alice + Bob", consulate="Montreal",
+        common_days=1, earliest_common=date(2026, 10, 10),
+        slots_found=1, min_slots=2,
+    )
+    samples = _parse_samples(collect_groups([rec], today=TODAY))
+    key = ("usvisa_group_ready", frozenset({("account", "Primary"),
+           ("members", "Alice + Bob"), ("consulate", "Montreal")}))
+    assert samples[key] == 0
+
+
+def test_group_no_common_day_emits_no_earliest_common_series():
+    rec = GroupRecord(
+        account="Primary", members="Alice + Bob", consulate="Montreal",
+        common_days=0, earliest_common=None, slots_found=0, min_slots=2,
+    )
+    samples = _parse_samples(collect_groups([rec], today=TODAY))
+    assert not [1 for (n, _) in samples if n == "usvisa_group_earliest_common_days"]
+    assert samples[("usvisa_group_common_days", frozenset({("account", "Primary"),
+                    ("members", "Alice + Bob"), ("consulate", "Montreal")}))] == 0
+
+
+def test_group_error_reports_poll_failure_and_nothing_else():
+    rec = GroupRecord(
+        account="Primary", members="Alice + Bob", consulate="Montreal",
+        common_days=0, earliest_common=None, slots_found=0, min_slots=2,
+        error="request failed",
+    )
+    samples = _parse_samples(collect_groups([rec], today=TODAY))
+    key = ("usvisa_group_poll_ok", frozenset({("account", "Primary"),
+           ("members", "Alice + Bob"), ("consulate", "Montreal")}))
+    assert samples[key] == 0
+    assert not [1 for (n, _) in samples if n == "usvisa_group_common_days"]
+
+
+def test_group_metrics_render_as_prometheus_text():
+    rec = GroupRecord(
+        account="Primary", members="Alice + Bob", consulate="Montreal",
+        common_days=2, earliest_common=date(2026, 10, 10),
+        slots_found=2, min_slots=2,
+    )
+    text = to_prometheus(collect_groups([rec], today=TODAY))
+    assert "usvisa_group_ready" in text
+    assert 'members="Alice + Bob"' in text
+    assert 'consulate="Montreal"' in text

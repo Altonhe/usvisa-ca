@@ -185,12 +185,49 @@
         },
 
         {
+          "title": "Joint constraints ready to book",
+          "description": "1 means every member of that group can be booked right now (a common day exists with enough time slots for all of them). Absent entirely means no group is configured.",
+          "layout": { "column": 1, "row": 11, "width": 4, "height": 3 },
+          "linkedEntityGuids": null,
+          "visualization": { "id": "viz.table" },
+          "rawConfiguration": {
+            "facet": { "showOtherSeries": false },
+            "nrqlQueries": [
+              {
+                "accountIds": [ 8461506 ],
+                "query": "FROM Metric SELECT latest(usvisa.group_ready) AS 'Ready', latest(usvisa.group_common_days) AS 'Common days', latest(usvisa.group_slots_found) AS 'Slots found', latest(usvisa.group_min_slots) AS 'Slots needed' FACET members, consulate LIMIT 20"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false }
+          }
+        },
+        {
+          "title": "Earliest day every member of a group can attend",
+          "description": "min() rather than latest(), for the same reason as the consulate chart above: a common day that briefly appeared and lost its capacity again should not vanish from the trend.",
+          "layout": { "column": 5, "row": 11, "width": 8, "height": 3 },
+          "linkedEntityGuids": null,
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "facet": { "showOtherSeries": false },
+            "legend": { "enabled": true },
+            "nrqlQueries": [
+              {
+                "accountIds": [ 8461506 ],
+                "query": "FROM Metric SELECT min(usvisa.group_earliest_common_days) FACET members, consulate TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false },
+            "yAxisLeft": { "zero": false }
+          }
+        },
+
+        {
           "title": "Reading this dashboard",
-          "layout": { "column": 1, "row": 11, "width": 12, "height": 3 },
+          "layout": { "column": 1, "row": 14, "width": 12, "height": 3 },
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.markdown" },
           "rawConfiguration": {
-            "text": "### How to read it\n\n**Set the time picker (top right) to `Last 7 days`.** Every chart here follows it — New Relic's picker supersedes any `SINCE` in a query, so none of these queries pin their own window. The trend and Movement charts need more than a day of history to say anything.\n\n**`min()`, not `latest()`.** `earliest_slot_days` is sampled every `poll_interval`. A chart bucket holds several samples, and `latest()` would keep only the last one — so a slot that appeared for a single sweep and was taken before the next would vanish from the graph. `min()` keeps the dip, which is the whole event worth seeing. The one place `latest()` is used is the *right now* tile, where the current state is the question.\n\n**\"Now\" far above \"Best seen\"** means an earlier slot did appear during the window and is already gone. If that keeps happening well inside your target window, the bot is losing races and `poll_interval` is too slow.\n\n**Day counts are computed when each point is pushed.** A point from a month ago means \"this many days out *as of then*\", which is what makes the trend meaningful — but only the newest point literally means \"from today\".\n\n**A blank `In window (d)`** means nothing has ever fallen inside your `earliest/latest_acceptable_date` — normal, not missing data. **A consulate absent entirely** returned zero availability: metrics are omitted rather than sent as `0`, because `0` would read as \"a slot is free today\". Use `usvisa.consulate_status` (`status` = `none` / `out-of-window` / `match` / `error`) and `usvisa.consulate_poll_ok` to tell \"nothing free\" from \"request failed\"."
+            "text": "### How to read it\n\n**Set the time picker (top right) to `Last 7 days`.** Every chart here follows it — New Relic's picker supersedes any `SINCE` in a query, so none of these queries pin their own window. The trend and Movement charts need more than a day of history to say anything.\n\n**`min()`, not `latest()`.** `earliest_slot_days` is sampled every `poll_interval`. A chart bucket holds several samples, and `latest()` would keep only the last one — so a slot that appeared for a single sweep and was taken before the next would vanish from the graph. `min()` keeps the dip, which is the whole event worth seeing. The one place `latest()` is used is the *right now* tile, where the current state is the question.\n\n**\"Now\" far above \"Best seen\"** means an earlier slot did appear during the window and is already gone. If that keeps happening well inside your target window, the bot is losing races and `poll_interval` is too slow.\n\n**Day counts are computed when each point is pushed.** A point from a month ago means \"this many days out *as of then*\", which is what makes the trend meaningful — but only the newest point literally means \"from today\".\n\n**A blank `In window (d)`** means nothing has ever fallen inside your `earliest/latest_acceptable_date` — normal, not missing data. **A consulate absent entirely** returned zero availability: metrics are omitted rather than sent as `0`, because `0` would read as \"a slot is free today\". Use `usvisa.consulate_status` (`status` = `none` / `out-of-window` / `match` / `error`) and `usvisa.consulate_poll_ok` to tell \"nothing free\" from \"request failed\".\n\n**Joint constraints (groups)** are a stricter thing than a plain consulate watch: every named member must land on the *same* day, and only once that day has `usvisa.group_min_slots` or more distinct time slots between them (`usvisa.group_slots_found`) does the bot book any of them. `usvisa.group_ready` = 1 is the moment that happens. A group's consulate is never counted in the per-application charts above — those omit it deliberately, since a lone member finding a day there means nothing until the others do too. No data at all for a group means `min_slots` has never been reached, which given a small post like Montreal can be the normal state for a long time."
           }
         }
       ]
