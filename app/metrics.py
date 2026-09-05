@@ -16,8 +16,16 @@ as a stable identity) and ``consulate``.
 
 Samples are **omitted rather than zeroed** when there is nothing to report. A
 consulate with no availability emits no ``earliest_slot_days`` sample at all,
-because 0 would read as "a slot is available today". Use ``consulate_status`` and
-``consulate_poll_ok`` to tell "nothing free" from "request failed".
+because 0 would read as "a slot is available today". Use ``consulate_status``,
+``consulate_poll_ok`` and ``consulate_error`` to tell "nothing free" from
+"request failed" -- these are different things: a fully booked consulate still
+answers the request successfully (``status="none"``, ``error=0``), while
+``error=1`` means the request itself could not be completed (network failure,
+exception, or a non-200 response), so no data -- not even "zero slots" --
+came back at all. ``consulate_error`` (and its ``account_error`` /
+``group_error`` counterparts) is the inverse of ``*_poll_ok``, provided
+because "error == 1" reads more naturally in alert conditions than
+"poll_ok == 0".
 """
 
 from __future__ import annotations
@@ -101,6 +109,10 @@ def collect(snapshot: Dict[str, Any], today: Optional[date] = None) -> List[Samp
         acc = account.get("name") or "unknown"
         add("account_login_ok", not account.get("error"),
             "1 when the last sign-in for this account succeeded.", account=acc)
+        add("account_error", bool(account.get("error")),
+            "1 when the last sign-in for this account failed; 0 otherwise. "
+            "Inverse of account_login_ok, kept for alerting on 'error == 1'.",
+            account=acc)
         add("account_applications", account.get("application_count") or 0,
             "Applications tracked for this account.", account=acc)
 
@@ -141,6 +153,14 @@ def collect(snapshot: Dict[str, Any], today: Optional[date] = None) -> List[Samp
 
                 add("consulate_poll_ok", status != "error",
                     "1 when the last availability request succeeded.", **loc)
+                add("consulate_error", status == "error",
+                    "1 when the last availability request itself failed "
+                    "(network error, exception, or a non-200 response), so no "
+                    "usable data came back; 0 otherwise, including when the "
+                    "request succeeded but the consulate has zero availability "
+                    "-- that is 'status=none', not an error. Inverse of "
+                    "consulate_poll_ok, kept for alerting on 'error == 1'.",
+                    **loc)
                 add("consulate_status", 1,
                     "Always 1; read the status attribute "
                     "(match/none/out-of-window/error).", **loc, status=status)
@@ -222,6 +242,13 @@ def collect_groups(
 
         add("group_poll_ok", not rec.error,
             "1 when the last joint availability check succeeded.", **loc)
+        add("group_error", bool(rec.error),
+            "1 when fetching availability for at least one group member "
+            "failed outright (request error / non-200), so the joint check "
+            "could not be evaluated; 0 otherwise, including when every "
+            "member's request succeeded but no common day was found -- that "
+            "is a valid 'no match yet' result, not an error. Inverse of "
+            "group_poll_ok, kept for alerting on 'error == 1'.", **loc)
         if rec.error:
             continue
 

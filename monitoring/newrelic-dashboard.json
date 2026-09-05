@@ -227,7 +227,7 @@
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.markdown" },
           "rawConfiguration": {
-            "text": "### How to read it\n\n**Set the time picker (top right) to `Last 7 days`.** Every chart here follows it — New Relic's picker supersedes any `SINCE` in a query, so none of these queries pin their own window. The trend and Movement charts need more than a day of history to say anything.\n\n**`min()`, not `latest()`.** `earliest_slot_days` is sampled every `poll_interval`. A chart bucket holds several samples, and `latest()` would keep only the last one — so a slot that appeared for a single sweep and was taken before the next would vanish from the graph. `min()` keeps the dip, which is the whole event worth seeing. The one place `latest()` is used is the *right now* tile, where the current state is the question.\n\n**\"Now\" far above \"Best seen\"** means an earlier slot did appear during the window and is already gone. If that keeps happening well inside your target window, the bot is losing races and `poll_interval` is too slow.\n\n**Day counts are computed when each point is pushed.** A point from a month ago means \"this many days out *as of then*\", which is what makes the trend meaningful — but only the newest point literally means \"from today\".\n\n**A blank `In window (d)`** means nothing has ever fallen inside your `earliest/latest_acceptable_date` — normal, not missing data. **A consulate absent entirely** returned zero availability: metrics are omitted rather than sent as `0`, because `0` would read as \"a slot is free today\". Use `usvisa.consulate_status` (`status` = `none` / `out-of-window` / `match` / `error`) and `usvisa.consulate_poll_ok` to tell \"nothing free\" from \"request failed\".\n\n**Joint constraints (groups)** are a stricter thing than a plain consulate watch: every named member must land on the *same* day, and only once that day has `usvisa.group_min_slots` or more distinct time slots between them (`usvisa.group_slots_found`) does the bot book any of them. `usvisa.group_ready` = 1 is the moment that happens. A group's consulate is never counted in the per-application charts above — those omit it deliberately, since a lone member finding a day there means nothing until the others do too. No data at all for a group means `min_slots` has never been reached, which given a small post like Montreal can be the normal state for a long time."
+            "text": "### How to read it\n\n**Set the time picker (top right) to `Last 7 days`.** Every chart here follows it — New Relic's picker supersedes any `SINCE` in a query, so none of these queries pin their own window. The trend and Movement charts need more than a day of history to say anything.\n\n**`min()`, not `latest()`.** `earliest_slot_days` is sampled every `poll_interval`. A chart bucket holds several samples, and `latest()` would keep only the last one — so a slot that appeared for a single sweep and was taken before the next would vanish from the graph. `min()` keeps the dip, which is the whole event worth seeing. The one place `latest()` is used is the *right now* tile, where the current state is the question.\n\n**\"Now\" far above \"Best seen\"** means an earlier slot did appear during the window and is already gone. If that keeps happening well inside your target window, the bot is losing races and `poll_interval` is too slow.\n\n**Day counts are computed when each point is pushed.** A point from a month ago means \"this many days out *as of then*\", which is what makes the trend meaningful — but only the newest point literally means \"from today\".\n\n**A blank `In window (d)`** means nothing has ever fallen inside your `earliest/latest_acceptable_date` — normal, not missing data. **A consulate absent entirely** returned zero availability: metrics are omitted rather than sent as `0`, because `0` would read as \"a slot is free today\". Use `usvisa.consulate_status` (`status` = `none` / `out-of-window` / `match` / `error`), `usvisa.consulate_poll_ok` and `usvisa.consulate_error` to tell \"nothing free\" from \"request failed\".\n\n**`usvisa.consulate_error` / `usvisa.account_error` / `usvisa.group_error`** are 1 only when the request itself could not be completed — network error, exception, or a non-200 response — so **no data at all** came back. They are explicitly 0 when the request succeeded but found zero availability (`status=none`): a fully booked consulate is a normal, successful poll, not an error, and these gauges never conflate the two. They are the exact inverse of the `*_poll_ok` gauges; both are sent so you can alert on `error == 1` directly instead of `poll_ok == 0`. See the **Diagnostics** page for dedicated error widgets.\n\n**Joint constraints (groups)** are a stricter thing than a plain consulate watch: every named member must land on the *same* day, and only once that day has `usvisa.group_min_slots` or more distinct time slots between them (`usvisa.group_slots_found`) does the bot book any of them. `usvisa.group_ready` = 1 is the moment that happens. A group's consulate is never counted in the per-application charts above — those omit it deliberately, since a lone member finding a day there means nothing until the others do too. No data at all for a group means `min_slots` has never been reached, which given a small post like Montreal can be the normal state for a long time."
           }
         }
       ]
@@ -322,8 +322,46 @@
           }
         },
         {
-          "title": "Ingest problems (async validation failures)",
+          "title": "Request errors right now — 1 = last request failed (not \"fully booked\")",
+          "description": "max() across consulate_error, account_error and group_error. These are 1 only when the request itself could not be completed (network error, exception, or non-200) -- a consulate that is simply fully booked answers successfully with status=none and error=0. Anything above 0 here means the watcher has no data at all for that dimension, not just no slots.",
           "layout": { "column": 1, "row": 7, "width": 6, "height": 3 },
+          "linkedEntityGuids": null,
+          "visualization": { "id": "viz.table" },
+          "rawConfiguration": {
+            "facet": { "showOtherSeries": false },
+            "nrqlQueries": [
+              {
+                "accountIds": [ 8461506 ],
+                "query": "FROM Metric SELECT max(usvisa.consulate_error) AS 'Consulate error' FACET account, application, consulate LIMIT 100"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false },
+            "thresholds": [
+              { "alertSeverity": "CRITICAL", "value": 1 }
+            ]
+          }
+        },
+        {
+          "title": "Error rate over time — consulate / account / group",
+          "description": "sum() of the error gauges per bucket. Non-zero means at least one request failed in that window, even if a later retry in the same bucket succeeded and would otherwise hide the blip.",
+          "layout": { "column": 7, "row": 7, "width": 6, "height": 3 },
+          "linkedEntityGuids": null,
+          "visualization": { "id": "viz.line" },
+          "rawConfiguration": {
+            "legend": { "enabled": true },
+            "nrqlQueries": [
+              {
+                "accountIds": [ 8461506 ],
+                "query": "FROM Metric SELECT sum(usvisa.consulate_error) AS 'Consulate', sum(usvisa.account_error) AS 'Account', sum(usvisa.group_error) AS 'Group' TIMESERIES AUTO"
+              }
+            ],
+            "platformOptions": { "ignoreTimeRange": false },
+            "yAxisLeft": { "zero": true }
+          }
+        },
+        {
+          "title": "Ingest problems (async validation failures)",
+          "layout": { "column": 1, "row": 10, "width": 6, "height": 3 },
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.table" },
           "rawConfiguration": {
@@ -338,7 +376,7 @@
         },
         {
           "title": "Every metric being sent",
-          "layout": { "column": 7, "row": 7, "width": 6, "height": 3 },
+          "layout": { "column": 7, "row": 10, "width": 6, "height": 3 },
           "linkedEntityGuids": null,
           "visualization": { "id": "viz.table" },
           "rawConfiguration": {
