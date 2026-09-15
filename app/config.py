@@ -271,6 +271,12 @@ class Config:
     consulate_poll_delay: int = 2
     account_poll_delay: int = 10
     max_consecutive_failures: int = 5
+    # The site sometimes reports a schedule as completed/locked (or an account
+    # as holding no actionable applications) when the response is really just
+    # transiently bad. Require "nothing actionable" to hold for this many
+    # sweeps in a row before the poller stops, so one glitch cannot end
+    # polling for good.
+    done_confirmations: int = 5
     # A day can show as available in /days.json and then be empty in
     # /times.json a few seconds later -- someone else took the last slot in
     # between. These retries buy back a few seconds of that race instead of
@@ -553,6 +559,9 @@ def load_config(path: Optional[Path] = None) -> Config:
         account_poll_delay=_as_int(raw.get("account_poll_delay"), 10, "account_poll_delay"),
         max_consecutive_failures=_as_int(
             raw.get("max_consecutive_failures"), 5, "max_consecutive_failures"
+        ),
+        done_confirmations=_as_int(
+            raw.get("done_confirmations"), 5, "done_confirmations"
         ),
         booking_retry_attempts=_as_int(
             raw.get("booking_retry_attempts"), 3, "booking_retry_attempts"

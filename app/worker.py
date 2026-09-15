@@ -63,6 +63,12 @@ class Worker:
         # account -> True if the current session was resumed from disk rather
         # than signed in fresh this run. Dashboard-only diagnostic.
         self._session_resumed: Dict[str, bool] = {}
+        # Consecutive sweeps that saw "nothing actionable any more". The site
+        # intermittently reports a schedule as completed/locked when it is
+        # really just a bad response, so we require this to hold for several
+        # sweeps in a row before stopping -- a single glitch must not end
+        # polling for good.
+        self._done_streak: int = 0
 
     # -- logging ---------------------------------------------------------
 
@@ -201,25 +207,44 @@ class Worker:
             self.store.save()
             self._emit_metrics()
 
-            if self._all_done():
+            if self._all_booked():
                 booked = [
                     app
                     for acc in self.store.snapshot()["accounts"]
                     for app in acc["applications"]
                     if app["state"] == "booked"
                 ]
-                if booked:
+                self.log(
+                    f"{len(booked)} application(s) booked and nothing else is "
+                    "actionable; polling stops here"
+                )
+                self.store.worker_status = "finished"
+                return
+
+            if self._all_done():
+                # Reached via "inactive / no scheduling action", which the site
+                # reports transiently. Require it to hold for several sweeps in
+                # a row before believing it.
+                self._done_streak += 1
+                needed = max(1, self.config.done_confirmations)
+                if self._done_streak < needed:
                     self.log(
-                        f"{len(booked)} application(s) booked and nothing else is "
-                        "actionable; polling stops here"
+                        "nothing actionable this sweep "
+                        f"({self._done_streak}/{needed}); the site sometimes "
+                        "reports this transiently, so re-checking before "
+                        "stopping"
                     )
                 else:
                     self.log(
-                        "no application offers a scheduling action any more; "
-                        "polling stops here"
+                        "no application offers a scheduling action any more "
+                        f"for {needed} sweep(s); polling stops here"
                     )
-                self.store.worker_status = "finished"
-                return
+                    self.store.worker_status = "finished"
+                    return
+            else:
+                # Something is actionable again: the terminal state was not
+                # real, so forget the streak.
+                self._done_streak = 0
 
             self.log(f"sleeping {self.config.poll_interval}s")
             if self._stop.wait(self.config.poll_interval):
@@ -259,6 +284,25 @@ class Worker:
         if not applications:
             return False
         return all(app["state"] in ("inactive", "booked") for app in applications)
+
+    def _all_booked(self) -> bool:
+        """True when every watched application is booked.
+
+        This is a genuinely terminal state -- a booked appointment does not
+        revert -- so it needs no confirmation streak, unlike the "inactive /
+        no scheduling action" case, which the site reports transiently.
+        """
+        snapshot = self.store.snapshot()
+        if not snapshot["accounts"]:
+            return False
+        if any(acc["error"] for acc in snapshot["accounts"]):
+            return False
+        applications = [
+            app for acc in snapshot["accounts"] for app in acc["applications"]
+        ]
+        if not applications:
+            return False
+        return all(app["state"] == "booked" for app in applications)
 
     # -- per account -----------------------------------------------------
 

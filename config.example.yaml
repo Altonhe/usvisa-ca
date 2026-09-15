@@ -20,6 +20,14 @@ test_mode: true
 # (application x consulate). Going below ~180 is asking to be rate limited.
 poll_interval: 300
 
+# The site intermittently reports a schedule as completed/locked (or an
+# account as holding nothing actionable) when the response is really just a
+# transient glitch. Require "nothing actionable any more" to hold for this
+# many sweeps in a row before the poller stops -- so one bad response cannot
+# end polling for good. A fully *booked* set still stops immediately, since a
+# booked appointment does not revert.
+done_confirmations: 5
+
 # A day can show as available in /days.json and then be empty in /times.json
 # a few seconds later -- someone else took the last slot in between. On a
 # match, book() re-checks /times.json this many times, waiting
