@@ -103,6 +103,49 @@ def _as_exclusions(value: Any, label: str) -> List[Tuple[date, date]]:
     return out
 
 
+def _as_hour_windows(value: Any, label: str) -> List[Tuple[int, int]]:
+    """Parse local-hour windows for fast polling.
+
+    Accepts ``[[9, 17], ...]``, ``[{from: 9, to: 17}]`` or the shorthand
+    ``"9-17, 20-22"``. Ends are inclusive of the start hour and exclusive of
+    the end hour, so ``[9, 17]`` means 09:00:00 up to 16:59:59. A window that
+    wraps midnight (``[22, 6]``) is allowed and handled by the caller.
+    """
+    if not value:
+        return []
+    items: Any = value
+    if isinstance(value, str):
+        items = [
+            part.split("-", 1)
+            for part in value.replace(";", ",").split(",")
+            if part.strip()
+        ]
+    out: List[Tuple[int, int]] = []
+    for i, item in enumerate(items, 1):
+        if isinstance(item, dict):
+            pair = (item.get("from") or item.get("start"), item.get("to") or item.get("end"))
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            pair = (item[0], item[1])
+        else:
+            raise ConfigError(
+                f"{label}[{i}]: expected [start_hour, end_hour], got {item!r}"
+            )
+        try:
+            start, end = int(str(pair[0]).strip()), int(str(pair[1]).strip())
+        except (ValueError, TypeError) as exc:
+            raise ConfigError(f"{label}[{i}]: hours must be integers, got {item!r}") from exc
+        for h in (start, end):
+            if not 0 <= h <= 24:
+                raise ConfigError(f"{label}[{i}]: hour {h} is outside 0..24")
+        if start == end:
+            raise ConfigError(
+                f"{label}[{i}]: start and end hour are both {start}, which selects "
+                "no time at all"
+            )
+        out.append((start, end))
+    return out
+
+
 def _as_bool(value: Any, default: bool) -> bool:
     if value is None or value == "":
         return default
@@ -271,6 +314,41 @@ class Config:
     consulate_poll_delay: int = 2
     account_poll_delay: int = 10
     max_consecutive_failures: int = 5
+    # Discovery (the landing page plus one continue_actions page per
+    # application) is all HTML, dwarfs days.json, and carries no availability.
+    # What it reports changes at most once, so it is cached this many seconds
+    # instead of being repaid every sweep. Dropped early whenever the answer
+    # could really have changed: a booking landed, or the session lapsed.
+    discovery_interval: int = 900
+    # days.json calls per sweep that may be in flight at once. The site is
+    # HTTP/1.1 (verified), so there is no multiplexing -- each slot is a
+    # separate TCP connection. Kept deliberately small: the point is to stop
+    # paying consulate_poll_delay serially, not to flood the host.
+    max_concurrent_requests: int = 3
+    # How long a pre-warmed booking form stays usable. The appointment page
+    # costs ~480ms to fetch and parse (measured); holding its
+    # authenticity_token and hidden fields ready means a match only has to pay
+    # times.json plus the POST. Refreshed in the background well inside the
+    # session's own lifetime.
+    booking_prewarm_ttl: int = 120
+    # Collapse availability requests that the server itself says are the same
+    # resource. days.json for a given (visa class, facility) is byte-identical
+    # across sibling schedule_ids -- confirmed by the server returning one
+    # ETag for both -- so one poll can answer for every member of that class.
+    calendar_sharing: bool = True
+    # Sweeps between forced re-observation of those equivalence classes. Guards
+    # against a class silently diverging: every Nth sweep polls each member
+    # again and re-derives the grouping from fresh ETags.
+    calendar_reverify_sweeps: int = 10
+    # Fire the booking POST with a guessed time in parallel with times.json,
+    # saving one round trip on a match. Off by default: a wrong-time POST is
+    # an unvalidated interaction with a live booking system.
+    speculative_booking: bool = False
+    # Poll faster during the hours slots are actually released. Empty disables
+    # it and poll_interval applies around the clock. Same hourly request
+    # budget, spent where it can actually win something.
+    fast_poll_interval: int = 0
+    active_hours: List[Tuple[int, int]] = field(default_factory=list)
     # The site sometimes reports a schedule as completed/locked (or an account
     # as holding no actionable applications) when the response is really just
     # transiently bad. Require "nothing actionable" to hold for this many
@@ -562,6 +640,26 @@ def load_config(path: Optional[Path] = None) -> Config:
         ),
         done_confirmations=_as_int(
             raw.get("done_confirmations"), 5, "done_confirmations"
+        ),
+        discovery_interval=_as_int(
+            raw.get("discovery_interval"), 900, "discovery_interval"
+        ),
+        max_concurrent_requests=max(1, _as_int(
+            raw.get("max_concurrent_requests"), 3, "max_concurrent_requests"
+        )),
+        booking_prewarm_ttl=_as_int(
+            raw.get("booking_prewarm_ttl"), 120, "booking_prewarm_ttl"
+        ),
+        calendar_sharing=_as_bool(raw.get("calendar_sharing"), True),
+        calendar_reverify_sweeps=max(1, _as_int(
+            raw.get("calendar_reverify_sweeps"), 10, "calendar_reverify_sweeps"
+        )),
+        speculative_booking=_as_bool(raw.get("speculative_booking"), False),
+        fast_poll_interval=_as_int(
+            raw.get("fast_poll_interval"), 0, "fast_poll_interval"
+        ),
+        active_hours=_as_hour_windows(
+            raw.get("active_hours"), "active_hours"
         ),
         booking_retry_attempts=_as_int(
             raw.get("booking_retry_attempts"), 3, "booking_retry_attempts"

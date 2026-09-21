@@ -222,6 +222,11 @@ class FakeClient:
     def get_available_days(self, schedule_id, facility_id):
         return []
 
+    def get_available_days_meta(self, schedule_id, facility_id):
+        # No ETag, so the worker learns no equivalence classes and keeps
+        # polling each pair individually -- the conservative default.
+        return self.get_available_days(schedule_id, facility_id), None
+
     def current_appointment(self, schedule_id):
         return None
 
@@ -268,6 +273,9 @@ def test_failure_forces_a_fresh_login_next_sweep(tmp_path, monkeypatch):
         name="A", email="a@example.com", password="p",
         target=make_target(consulates=[94]),
     )]
+    # This test is about the discovery error path, so discovery has to actually
+    # run every sweep rather than being served from its cache.
+    worker.config.discovery_interval = 0
     worker._seed_state()
     worker._sweep()          # login #1
     worker._sweep()          # fails, drops the session
@@ -358,6 +366,8 @@ def test_network_error_keeps_the_session(tmp_path, monkeypatch):
 
     worker, store = build_worker(tmp_path)
     worker.config.accounts = [_account()]
+    # Same reason as above: exercise discovery itself, not its cache.
+    worker.config.discovery_interval = 0
     logged = []
     worker.log = logged.append
     worker._seed_state()
@@ -486,6 +496,11 @@ class GroupClient:
 
     def get_available_days(self, schedule_id, facility_id):
         return self.days_by_member.get(schedule_id, [])
+
+    def get_available_days_meta(self, schedule_id, facility_id):
+        # Distinct per member, so nothing is ever shared between them: these
+        # tests assert genuinely per-member availability.
+        return self.get_available_days(schedule_id, facility_id), None
 
     def get_available_times(self, schedule_id, facility_id, day):
         return self.times_by_member_day.get((schedule_id, day), [])

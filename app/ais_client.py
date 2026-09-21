@@ -27,11 +27,12 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import requests
 
@@ -52,6 +53,37 @@ RESCHEDULE_LABEL = "reschedule appointment"
 FACILITY_KEY = "appointments[consulate_appointment][facility_id]"
 DATE_KEY = "appointments[consulate_appointment][date]"
 TIME_KEY = "appointments[consulate_appointment][time]"
+
+
+@dataclass
+class PrewarmedForm:
+    """A booking form fetched and parsed ahead of a match.
+
+    The appointment page costs a full round trip (~480ms measured) plus parsing
+    before a single useful byte is sent, and on a live site that window is
+    exactly when a slot gets taken by somebody else. Holding the parsed payload
+    and its ``authenticity_token`` ready collapses the booking path to
+    ``times.json`` plus the POST.
+
+    ``fetched_at`` is monotonic, so a clock change cannot make a stale form
+    look fresh.
+    """
+
+    schedule_id: str
+    action: str
+    payload: Dict[str, str]
+    referer: str
+    csrf_token: str
+    fetched_at: float
+    # Time-slot strings seen at each facility, newest first. Used only by
+    # speculative booking to guess a plausible time before times.json answers.
+    known_times: Dict[int, List[str]] = None  # type: ignore[assignment]
+
+    def age(self) -> float:
+        return time.monotonic() - self.fetched_at
+
+    def is_fresh(self, ttl: float) -> bool:
+        return self.age() < ttl
 
 
 class AisError(RuntimeError):
@@ -137,6 +169,7 @@ class AisClient:
         user_agent: str = "",
         timeout: int = 30,
         request_delay: float = 0.0,
+        max_connections: int = 4,
         logger: Optional[Callable[[str], None]] = None,
     ):
         if not email or not password:
@@ -149,7 +182,23 @@ class AisClient:
         self.request_delay = request_delay
         self._log = logger or (lambda msg: print(msg, flush=True))
         self.landing_url: str = ""
+        # url -> (etag, last parsed payload). Lets a 304 replay the previous
+        # body, and lets callers use the etag as a calendar identity.
+        self._etag_cache: Dict[str, Tuple[str, Any]] = {}
+        self._etag_lock = threading.Lock()
+        # Pre-warmed booking form state, keyed by schedule_id.
+        self._prewarmed: Dict[str, "PrewarmedForm"] = {}
+        self._prewarm_lock = threading.Lock()
         self.session = requests.Session()
+        # The availability sweep fires several days.json calls at once and the
+        # host is HTTP/1.1, so each concurrent call needs its own connection.
+        # Without raising this urllib3 would warn and serialise them.
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=max_connections,
+            pool_maxsize=max_connections,
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         self.session.headers.update({
             "User-Agent": user_agent or (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -230,26 +279,69 @@ class AisClient:
         successful request yielding an empty list means "no availability", which
         is a normal outcome and must not be reported as an error.
         """
+        payload, _etag, _fresh = self._get_json_meta(url, referer=referer)
+        return payload
+
+    def _get_json_meta(self, url: str, referer: str = ""):
+        """GET a JSON endpoint, reporting the server's ETag alongside the body.
+
+        Returns ``(payload, etag, from_cache)``. ``payload`` is ``None`` only
+        when the request genuinely failed.
+
+        The site serves ``days.json`` with a weak ETag and
+        ``must-revalidate`` (verified against the live host), and answers
+        ``If-None-Match`` with a 304. A 304 carries no body, so the previously
+        parsed payload is replayed -- the caller cannot tell the difference,
+        it just costs a fraction of the bytes.
+
+        The ETag is surfaced because it doubles as an *identity* for the
+        calendar: two sibling schedule_ids at the same facility come back with
+        the same ETag, which is the server stating outright that they are the
+        same resource. That is a far stronger signal than comparing bodies
+        ourselves, and it is what lets several applications share one request.
+        """
         headers = {
             "X-Requested-With": "XMLHttpRequest",
             "Accept": "application/json, text/javascript, */*; q=0.01",
         }
         if referer:
             headers["Referer"] = referer
+
+        with self._etag_lock:
+            cached = self._etag_cache.get(url)
+        if cached:
+            headers["If-None-Match"] = cached[0]
+
         try:
             resp = self.session.get(url, headers=headers, timeout=self.timeout)
         except requests.RequestException as exc:
             self._log(f"request failed: {exc}")
-            return None
+            return None, None, False
+
+        if resp.status_code == 304:
+            if cached:
+                return cached[1], cached[0], True
+            # 304 without anything cached should not happen; treat as a miss
+            # rather than inventing data.
+            self._log(f"HTTP 304 from {url} but nothing cached; ignoring")
+            return None, None, False
+
         if resp.status_code != 200:
             self._log(f"HTTP {resp.status_code} from {url}")
-            return None
+            return None, None, False
+
         try:
-            return resp.json()
+            payload = resp.json()
         except ValueError:
             snippet = resp.text[:160].replace("\n", " ")
             self._log(f"non-JSON response from {url}: {snippet}")
-            return None
+            return None, None, False
+
+        etag = resp.headers.get("ETag")
+        if etag:
+            with self._etag_lock:
+                self._etag_cache[url] = (etag, payload)
+        return payload, etag, False
 
     def _post_form(self, url: str, payload: Dict[str, str], page: Page) -> requests.Response:
         return self.session.post(
@@ -538,15 +630,28 @@ class AisClient:
         self, schedule_id: str, facility_id: int
     ) -> Optional[List[date]]:
         """Sorted available days; ``[]`` when fully booked, ``None`` on error."""
-        data = self._get_json(
+        days, _etag = self.get_available_days_meta(schedule_id, facility_id)
+        return days
+
+    def get_available_days_meta(
+        self, schedule_id: str, facility_id: int
+    ) -> Tuple[Optional[List[date]], Optional[str]]:
+        """As :meth:`get_available_days`, plus the server's ETag for the calendar.
+
+        The ETag identifies the calendar itself rather than who asked for it:
+        sibling schedule_ids of the same visa class at the same facility come
+        back with an identical ETag. Callers use that to let one request answer
+        for several applications instead of asking the same question N times.
+        """
+        data, etag, _from_cache = self._get_json_meta(
             self.days_url(schedule_id, facility_id),
             referer=self.appointment_url(schedule_id),
         )
         if data is None:
-            return None
+            return None, None
         if not isinstance(data, list):
             self._log(f"unexpected days payload for facility {facility_id}: {data!r}"[:160])
-            return None
+            return None, None
         days: List[date] = []
         for item in data:
             raw = item.get("date") if isinstance(item, dict) else None
@@ -556,7 +661,7 @@ class AisClient:
                 days.append(datetime.strptime(raw, "%Y-%m-%d").date())
             except ValueError:
                 self._log(f"skipping unparseable date {raw!r}")
-        return sorted(days)
+        return sorted(days), etag
 
     def get_available_times(
         self, schedule_id: str, facility_id: int, day: date
@@ -620,6 +725,173 @@ class AisClient:
         self._log("acknowledging interstitial consent page")
         resp = self._post_form(target.action, payload, page)
         return Page(resp.text, base_url=resp.url)
+
+    def prewarm_booking(self, schedule_id: str, force: bool = False,
+                        ttl: float = 120.0) -> Optional[PrewarmedForm]:
+        """Fetch and parse the booking form before there is anything to book.
+
+        Verified against the live site: ``/appointment`` serves
+        ``#appointment-form`` directly with a populated ``authenticity_token``,
+        and no reCAPTCHA widget is injected while the session is in good
+        standing. So everything the POST needs except ``date`` and ``time`` can
+        be prepared in advance and kept on hand.
+
+        Returns ``None`` rather than raising -- pre-warming is an optimisation,
+        and failing to do it must never take down a sweep. The booking path
+        falls back to fetching the page inline.
+        """
+        if not force:
+            existing = self.peek_prewarmed(schedule_id, ttl)
+            if existing is not None:
+                return existing
+        try:
+            page = self.open_appointment_page(schedule_id)
+            form = page.form_by_id("appointment-form")
+            if form is None:
+                self._log(f"prewarm: no appointment-form for {schedule_id}")
+                return None
+            payload = form.payload()
+            payload.setdefault("commit", "Submit")
+            # Solve now, off the hot path, if the site happens to be asking.
+            payload.update(self._solve_captcha(page, form.action))
+            warmed = PrewarmedForm(
+                schedule_id=schedule_id,
+                action=form.action,
+                payload=payload,
+                referer=page.base_url or self.appointment_url(schedule_id),
+                csrf_token=page.csrf_token() or "",
+                fetched_at=time.monotonic(),
+                known_times={},
+            )
+        except (AisError, requests.RequestException) as exc:
+            self._log(f"prewarm failed for {schedule_id} (ignored): {exc}")
+            return None
+
+        with self._prewarm_lock:
+            previous = self._prewarmed.get(schedule_id)
+            if previous and previous.known_times:
+                warmed.known_times = previous.known_times
+            self._prewarmed[schedule_id] = warmed
+        return warmed
+
+    def peek_prewarmed(self, schedule_id: str, ttl: float) -> Optional[PrewarmedForm]:
+        """Return the cached form for ``schedule_id`` while it is still fresh."""
+        with self._prewarm_lock:
+            warmed = self._prewarmed.get(schedule_id)
+        if warmed is not None and warmed.is_fresh(ttl):
+            return warmed
+        return None
+
+    def remember_times(self, schedule_id: str, facility_id: int,
+                       times: List[str]) -> None:
+        """Record the time-slot roster seen at a facility.
+
+        Slots come from a small fixed roster per post, so yesterday's list is a
+        good predictor of today's. Only speculative booking reads this.
+        """
+        if not times:
+            return
+        with self._prewarm_lock:
+            warmed = self._prewarmed.get(schedule_id)
+            if warmed is None:
+                return
+            if warmed.known_times is None:
+                warmed.known_times = {}
+            warmed.known_times[facility_id] = list(times)
+
+    def invalidate_prewarm(self, schedule_id: Optional[str] = None) -> None:
+        """Drop pre-warmed state, wholly or for one application."""
+        with self._prewarm_lock:
+            if schedule_id is None:
+                self._prewarmed.clear()
+            else:
+                self._prewarmed.pop(schedule_id, None)
+
+    def book_prewarmed(
+        self,
+        slot: Slot,
+        warmed: PrewarmedForm,
+        dry_run: bool = True,
+        speculative: bool = False,
+    ) -> bool:
+        """Submit a booking using an already-parsed form.
+
+        The hot path is only ``times.json`` (when the time is not already
+        known) and the POST itself. Everything else -- the appointment page,
+        its hidden fields, its CSRF token -- was paid for in advance.
+
+        With ``speculative`` and a remembered roster for this facility, the
+        ``times.json`` round trip is skipped on the first try by guessing the
+        most recently seen time. A wrong guess costs one extra POST and then
+        proceeds normally. Off by default: what the site does with a POST
+        naming an unavailable time cannot be established without sending one.
+        """
+        payload = dict(warmed.payload)
+        payload[FACILITY_KEY] = str(slot.facility_id)
+        payload[DATE_KEY] = slot.day.isoformat()
+
+        guess = ""
+        if speculative and not slot.time:
+            roster = (warmed.known_times or {}).get(slot.facility_id) or []
+            if roster:
+                guess = roster[0]
+
+        if guess and not dry_run:
+            self._log(
+                f"speculative booking: trying remembered time {guess} at "
+                f"{slot.consulate} without waiting for times.json"
+            )
+            attempt = dict(payload)
+            attempt[TIME_KEY] = guess
+            resp = self._post_prewarmed(attempt, warmed)
+            slot.time = guess
+            if self._confirm_booking(slot, resp, Page(resp.text, base_url=resp.url)):
+                self.invalidate_prewarm(slot.schedule_id)
+                return True
+            slot.time = ""
+            self._log("speculative attempt did not take; falling back to times.json")
+
+        if not slot.time:
+            times = self.get_available_times(slot.schedule_id, slot.facility_id, slot.day)
+            if not times:
+                self._log(f"no time slots left on {slot.day} at {slot.consulate}")
+                return False
+            self.remember_times(slot.schedule_id, slot.facility_id, times)
+            slot.time = times[0]
+        payload[TIME_KEY] = slot.time
+
+        redacted = {k: v for k, v in payload.items() if k != "authenticity_token"}
+        self._log(
+            f"booking payload (prewarmed, form age {warmed.age():.0f}s): "
+            f"{json.dumps(redacted, ensure_ascii=False)}"
+        )
+        if dry_run:
+            self._log(
+                f"TEST MODE: stopping before submit. Would book {slot} "
+                f"for schedule {slot.schedule_id}"
+            )
+            return False
+
+        resp = self._post_prewarmed(payload, warmed)
+        # A used token cannot be reused, and the form state is now stale.
+        self.invalidate_prewarm(slot.schedule_id)
+        return self._confirm_booking(slot, resp, Page(resp.text, base_url=resp.url))
+
+    def _post_prewarmed(self, payload, warmed):
+        """POST a booking using the pre-warmed form's token and referer."""
+        return self.session.post(
+            warmed.action,
+            data=payload,
+            headers={
+                "Referer": warmed.referer,
+                "Origin": BASE_URL,
+                "X-CSRF-Token": warmed.csrf_token,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            timeout=self.timeout,
+            allow_redirects=True,
+        )
+
 
     def book(
         self,

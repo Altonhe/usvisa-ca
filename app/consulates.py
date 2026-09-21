@@ -6,7 +6,9 @@ form.  All seven were read directly from the live ``<select>`` on
 ``/en-ca/niv/schedule/{id}/appointment`` and are confirmed correct.
 """
 
+from datetime import datetime
 from typing import Dict, List, Union
+from zoneinfo import ZoneInfo
 
 # facility_id -> canonical display name (as labelled by the site)
 FACILITIES: Dict[int, str] = {
@@ -17,6 +19,27 @@ FACILITIES: Dict[int, str] = {
     93: "Quebec City",
     94: "Toronto",
     95: "Vancouver",
+}
+
+# facility_id -> IANA timezone of the post itself.
+#
+# Appointment slots are released by the consulate, so "business hours" is a
+# fact about where the post is, not about where this process happens to run.
+# Canada spans 4.5 zones: when it is 08:00 in Toronto it is 05:00 in Vancouver,
+# so driving a schedule off a single container-wide TZ misjudges every post
+# except one. The TZ environment variable stays what it was meant to be -- the
+# timezone log timestamps are rendered in.
+#
+# Montreal, Ottawa and Quebec City are all Eastern; IANA treats
+# America/Montreal as a link to America/Toronto, so the canonical name is used.
+TIMEZONES: Dict[int, str] = {
+    89: "America/Edmonton",     # Calgary, Alberta -- Mountain
+    90: "America/Halifax",      # Atlantic
+    91: "America/Toronto",      # Montreal -- Eastern
+    92: "America/Toronto",      # Ottawa -- Eastern
+    93: "America/Toronto",      # Quebec City -- Eastern
+    94: "America/Toronto",      # Eastern
+    95: "America/Vancouver",    # Pacific
 }
 
 # Kept for backwards compatibility with older configs / scripts that did
@@ -91,6 +114,34 @@ def resolve_consulate(token: Union[str, int]) -> int:
 def consulate_name(facility_id: int) -> str:
     """Human readable name for a facility id (falls back to the raw id)."""
     return FACILITIES.get(facility_id, f"facility#{facility_id}")
+
+
+def consulate_timezone(facility_id: int) -> str:
+    """IANA timezone name for a facility id.
+
+    Falls back to Eastern, which is where four of the seven posts are, rather
+    than raising: a missing entry must never be able to stop polling.
+    """
+    return TIMEZONES.get(facility_id, "America/Toronto")
+
+
+def consulate_now(facility_id: int) -> datetime:
+    """Current local time at the consulate.
+
+    ``zoneinfo`` needs a tz database, which neither Windows nor a slim Docker
+    image provides on its own -- hence the ``tzdata`` dependency. If the lookup
+    somehow still fails, this degrades to process-local time rather than
+    breaking the caller.
+    """
+    try:
+        return datetime.now(ZoneInfo(consulate_timezone(facility_id)))
+    except Exception:  # noqa: BLE001 - never worth failing a sweep over
+        return datetime.now()
+
+
+def consulate_local_hour(facility_id: int) -> int:
+    """Hour of day (0-23) as it currently reads at the consulate."""
+    return consulate_now(facility_id).hour
 
 
 def parse_consulate_list(raw: Union[str, None], default_all: bool = True) -> List[int]:

@@ -17,10 +17,12 @@ Design notes worth knowing:
 from __future__ import annotations
 
 import threading
+import time
 import traceback
 import re
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -29,7 +31,8 @@ from .ais_client import (AisClient, AisError, LoginFailed, Schedule,
                          parse_site_date)
 from .capsolver import CapSolver, CapSolverError
 from .config import Account, Application, Config, Group, Target
-from .consulates import consulate_name
+from .calendars import CalendarCache
+from .consulates import consulate_local_hour, consulate_name
 from .metrics import GroupRecord, collect, collect_groups
 from .newrelic import NewRelicClient
 from .notifier import TelegramNotifier
@@ -63,6 +66,20 @@ class Worker:
         # account -> True if the current session was resumed from disk rather
         # than signed in fresh this run. Dashboard-only diagnostic.
         self._session_resumed: Dict[str, bool] = {}
+        # account -> (monotonic timestamp, resolved (Application, Schedule) pairs).
+        # Discovery costs one landing page plus one continue_actions page per
+        # application -- all HTML, all far larger than days.json, and none of it
+        # carries availability. What it reports (is this application still
+        # actionable, is it already booked) changes at most once, so paying for
+        # it every sweep was the single largest waste in the polling loop.
+        self._discovery_cache: Dict[str, Tuple[float, List[Tuple[Application, Schedule]]]] = {}
+        # Learns, from the server's own ETags, which (schedule_id, facility)
+        # pairs are the same calendar, so one request can answer for several
+        # applications instead of asking the identical question per applicant.
+        self._calendars = CalendarCache(
+            enabled=config.calendar_sharing,
+            reverify_sweeps=config.calendar_reverify_sweeps,
+        )
         # Consecutive sweeps that saw "nothing actionable any more". The site
         # intermittently reports a schedule as completed/locked when it is
         # really just a bad response, so we require this to hold for several
@@ -201,8 +218,9 @@ class Worker:
                 traceback.print_exc()
 
             self.store.last_sweep_finished = datetime.now(timezone.utc)
+            interval = self._current_interval()
             self.store.next_sweep_at = self.store.last_sweep_finished + timedelta(
-                seconds=self.config.poll_interval
+                seconds=interval
             )
             self.store.save()
             self._emit_metrics()
@@ -246,11 +264,86 @@ class Worker:
                 # real, so forget the streak.
                 self._done_streak = 0
 
-            self.log(f"sleeping {self.config.poll_interval}s")
-            if self._stop.wait(self.config.poll_interval):
+            self.log(f"sleeping {interval}s")
+            if self._stop.wait(interval):
                 break
 
         self.store.worker_status = "stopped"
+
+    def _watched_consulates(self) -> List[int]:
+        """Every facility the configuration actually watches, in config order."""
+        found: List[int] = []
+        for account in self.config.accounts:
+            targets: List[Target] = [account.target]
+            targets.extend(a.target for a in account.applications)
+            for group in account.groups:
+                targets.append(group.target)
+                found.extend(group.consulates)
+            for target in targets:
+                found.extend(target.consulates)
+
+        seen = set()
+        unique: List[int] = []
+        for facility_id in found:
+            if facility_id not in seen:
+                seen.add(facility_id)
+                unique.append(facility_id)
+        return unique
+
+    def _current_interval(self) -> int:
+        """Seconds to wait before the next sweep.
+
+        ``poll_interval`` normally, or ``fast_poll_interval`` while any watched
+        consulate is inside one of ``active_hours``.
+
+        The hours are read **at the consulate**, not on this machine. Slots are
+        released by the post, so its business hours are the thing worth
+        tracking, and Canada spans 4.5 timezones -- 08:00 in Toronto is 05:00 in
+        Vancouver. Judging that by the container's own clock would be right for
+        at most one post.
+
+        A sweep covers every account at once and cannot be sped up for one
+        consulate alone, so the window is treated as open when *any* watched
+        post is inside it.
+        """
+        fast = self.config.fast_poll_interval
+        if fast <= 0 or not self.config.active_hours:
+            return self.config.poll_interval
+
+        for facility_id in self._watched_consulates():
+            hour = consulate_local_hour(facility_id)
+            for start, end in self.config.active_hours:
+                inside = (
+                    start <= hour < end if start < end
+                    else hour >= start or hour < end
+                )
+                if inside:
+                    return fast
+        return self.config.poll_interval
+
+    def _prewarm_bookings(self, client: AisClient, account: Account) -> None:
+        """Keep a parsed booking form on hand for every actionable application.
+
+        Runs between sweeps, never on the hot path. Failures are swallowed
+        because this is purely an optimisation -- if the form is missing the
+        booking path just fetches it inline, exactly as it used to.
+        """
+        if not hasattr(client, "prewarm_booking"):
+            return
+        cached = self._discovery_cache.get(account.name)
+        if cached is None:
+            return
+        for app, schedule in cached[1]:
+            if self._stop.is_set():
+                return
+            if self._booked.get(app.schedule_id) or not schedule.actionable:
+                continue
+            try:
+                client.prewarm_booking(
+                    app.schedule_id, ttl=self.config.booking_prewarm_ttl
+                )
+            except Exception as exc:  # noqa: BLE001 - never critical
+                self.log(f"[{account.name}] prewarm skipped: {exc}")
 
     def _emit_metrics(self) -> None:
         """Push one batch of gauges after each sweep.
@@ -319,6 +412,7 @@ class Worker:
                 self.log(f"[{account.name}] {exc}")
                 self._clients.pop(account.name, None)
                 self._discard_saved_session(account.name)
+                self._invalidate_discovery(account.name)
             except TransientNetworkError as exc:
                 # The network blipped, not the session. Keep the cookies and try
                 # again next sweep; a full traceback here is pure noise.
@@ -354,6 +448,9 @@ class Worker:
         self._failures[account.name] = count
         self.log(f"[{account.name}] {reason} (consecutive failures: {count})")
         self.store.set_account_error(account.name, reason)
+        # A fresh session invalidates the CSRF token in any pre-warmed form and
+        # the discovery that was read with the old one.
+        self._invalidate_discovery(account.name)
         # Force a fresh session next sweep.
         self._clients.pop(account.name, None)
         self._discard_saved_session(account.name)
@@ -446,18 +543,61 @@ class Worker:
             self._sweep_group(account, client, group, by_id)
 
         checked: List[str] = []
-        for app, schedule in applications:
+        pending = [
+            (app, sched) for app, sched in applications
+            if not self._booked.get(app.schedule_id)
+        ]
+        # One batched, deduplicated, concurrent fetch for the whole account
+        # rather than a delayed request per application per consulate.
+        pairs = [
+            (app.schedule_id, facility_id)
+            for app, _ in pending
+            for facility_id in app.target.consulates
+        ]
+        calendars = self._fetch_calendars(account, client, pairs)
+
+        for app, schedule in pending:
             if self._stop.is_set():
                 return
-            if self._booked.get(app.schedule_id):
-                continue
             checked.append(app.display_name)
-            self._sweep_application(account, client, app, schedule)
+            self._sweep_application(account, client, app, schedule, calendars)
 
         if checked:
             self.notifier.no_availability(account.name, checked)
+        # Reload the booking form for next time, off the hot path, so a match
+        # on the next sweep only has to pay times.json plus the POST.
+        self._prewarm_bookings(client, account)
 
     def _resolve_applications(
+        self, account: Account, client: AisClient
+    ) -> List[Tuple[Application, Schedule]]:
+        """Pair applications with their live state, reusing a fresh discovery.
+
+        Discovery is expensive and nearly static: one landing page plus one
+        ``continue_actions`` page per application, all HTML, none of it
+        carrying availability. Re-running it every sweep was costing more
+        requests than the availability polling it exists to set up, so the
+        result is cached for ``discovery_interval`` seconds.
+
+        The cache is dropped whenever the answer could actually have changed
+        -- a booking landed, the session lapsed, or the account errored -- so
+        staleness never outlives the fact that produced it.
+        """
+        cached = self._discovery_cache.get(account.name)
+        if cached is not None:
+            age = time.monotonic() - cached[0]
+            if age < self.config.discovery_interval:
+                return cached[1]
+
+        pairs = self._discover_applications(account, client)
+        self._discovery_cache[account.name] = (time.monotonic(), pairs)
+        return pairs
+
+    def _invalidate_discovery(self, account_name: str) -> None:
+        """Force a fresh discovery on this account's next sweep."""
+        self._discovery_cache.pop(account_name, None)
+
+    def _discover_applications(
         self, account: Account, client: AisClient
     ) -> List[Tuple[Application, Schedule]]:
         """Pair configured applications with their live state on the site.
@@ -703,13 +843,81 @@ class Worker:
 
     # -- per application -------------------------------------------------
 
+    def _fetch_calendars(
+        self,
+        account: Account,
+        client: AisClient,
+        pairs: List[Tuple[str, int]],
+    ) -> Dict[Tuple[str, int], Optional[List[date]]]:
+        """Fetch every calendar the sweep needs, in as few requests as possible.
+
+        Two savings compound here. Requests the server reports as the same
+        resource are made once and shared (see :mod:`app.calendars`), and what
+        remains is issued concurrently instead of paying
+        ``consulate_poll_delay`` between each one -- that delay alone was
+        turning a handful of 200ms calls into a 16-second sweep.
+
+        Concurrency is bounded by ``max_concurrent_requests`` because the host
+        is HTTP/1.1: every slot is a separate TCP connection, so this is a knob
+        for footprint, not just speed. With it set to 1 the old sequential,
+        delayed behaviour is restored exactly.
+
+        Returns ``(schedule_id, facility_id) -> days``, where ``None`` means the
+        request failed and ``[]`` means it succeeded and nothing is available.
+        """
+        if not pairs:
+            return {}
+
+        plans = self._calendars.plan(pairs, self.store.sweep_count)
+        if len(plans) < len(pairs):
+            self.log(
+                f"[{account.name}] {CalendarCache.summarise(plans, len(pairs))}"
+            )
+
+        results: Dict[Tuple[str, int], Optional[List[date]]] = {}
+
+        def fetch(plan):
+            return plan, client.get_available_days_meta(
+                plan.schedule_id, plan.facility_id
+            )
+
+        def record(plan, days, etag) -> None:
+            # Only the polled pair teaches us its ETag; the ones riding along
+            # keep whatever class they were already in.
+            self._calendars.observe(plan.schedule_id, plan.facility_id, etag)
+            for schedule_id in plan.covers:
+                results[(schedule_id, plan.facility_id)] = days
+
+        workers = min(self.config.max_concurrent_requests, len(plans))
+        if workers > 1:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="days"
+            ) as pool:
+                futures = [pool.submit(fetch, plan) for plan in plans]
+                for future in as_completed(futures):
+                    plan, (days, etag) = future.result()
+                    record(plan, days, etag)
+        else:
+            for index, plan in enumerate(plans):
+                if self._stop.is_set():
+                    break
+                if index and self.config.consulate_poll_delay:
+                    if self._stop.wait(self.config.consulate_poll_delay):
+                        break
+                plan, (days, etag) = fetch(plan)
+                record(plan, days, etag)
+
+        return results
+
     def _sweep_application(
         self,
         account: Account,
         client: AisClient,
         app: Application,
         schedule: Schedule,
+        calendars: Optional[Dict[Tuple[str, int], Optional[List[date]]]] = None,
     ) -> None:
+        calendars = calendars if calendars is not None else {}
         target = app.target
         if not target.consulates:
             self.store.update_application(
@@ -728,7 +936,12 @@ class Worker:
         for i, facility_id in enumerate(target.consulates):
             if self._stop.is_set():
                 return
-            days = client.get_available_days(app.schedule_id, facility_id)
+            if (app.schedule_id, facility_id) in calendars:
+                days = calendars[(app.schedule_id, facility_id)]
+            else:
+                # Not in the batch (a consulate added mid-sweep, or a caller
+                # that did not prefetch): fall back to asking directly.
+                days = client.get_available_days(app.schedule_id, facility_id)
             status = ConsulateStatus(facility_id=facility_id)
 
             if days is None:
@@ -761,8 +974,11 @@ class Worker:
 
             self.store.update_consulate(account.name, app.schedule_id, status)
             if i < len(target.consulates) - 1:
-                if self._stop.wait(self.config.consulate_poll_delay):
-                    return
+                if (app.schedule_id, facility_id) not in calendars:
+                    # Only space out requests we actually made ourselves; the
+                    # batch already did its own pacing.
+                    if self._stop.wait(self.config.consulate_poll_delay):
+                        return
 
         self.store.update_application(
             account.name,
@@ -794,12 +1010,27 @@ class Worker:
         # between the match and the booking request itself. The Telegram
         # message still reports what was attempted, just a moment later.
         try:
-            ok = client.book(
-                slot,
-                dry_run=self.config.test_mode,
-                retry_attempts=self.config.booking_retry_attempts,
-                retry_delay=self.config.booking_retry_delay,
-            )
+            warmed = client.peek_prewarmed(
+                app.schedule_id, self.config.booking_prewarm_ttl
+            ) if hasattr(client, "peek_prewarmed") else None
+
+            if warmed is not None:
+                # The appointment page, its hidden fields and its CSRF token
+                # were already fetched and parsed, so the only round trips left
+                # are times.json and the POST itself. On a live site that
+                # difference is most of the window in which somebody else takes
+                # the slot.
+                ok = client.book_prewarmed(
+                    slot, warmed, dry_run=self.config.test_mode,
+                    speculative=self.config.speculative_booking,
+                )
+            else:
+                ok = client.book(
+                    slot,
+                    dry_run=self.config.test_mode,
+                    retry_attempts=self.config.booking_retry_attempts,
+                    retry_delay=self.config.booking_retry_delay,
+                )
         except AisError as exc:
             self.log(f"[{account.name}] booking failed: {exc}")
             self.store.update_application(
@@ -817,6 +1048,12 @@ class Worker:
 
         if ok:
             self._booked[app.schedule_id] = True
+            # The site's own view of this application just changed, so the
+            # cached discovery no longer describes it, and the consumed
+            # authenticity_token cannot be reused.
+            self._invalidate_discovery(account.name)
+            if hasattr(client, "invalidate_prewarm"):
+                client.invalidate_prewarm(app.schedule_id)
             self.store.update_application(
                 account.name,
                 app.schedule_id,

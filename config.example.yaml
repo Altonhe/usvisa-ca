@@ -20,6 +20,31 @@ test_mode: true
 # (application x consulate). Going below ~180 is asking to be rate limited.
 poll_interval: 300
 
+# --- Pacing ---------------------------------------------------------------
+# These four had no entry in this file and were silently using the defaults
+# below. They are listed explicitly because account_poll_delay in particular
+# dominates how long a sweep takes, and you cannot tune what you cannot see.
+
+# Seconds to wait between accounts inside one sweep. Paid once per extra
+# account, every sweep: with two accounts that is a flat 10s added to every
+# sweep regardless of how fast the requests themselves are. Lower it if your
+# sweep wall time matters more than spreading load across accounts.
+account_poll_delay: 10
+
+# Seconds between individual availability requests when they are NOT being run
+# concurrently. Still applies in three places: between the continue_actions
+# pages during discovery, between members of a group (joint constraint), and
+# in the availability fetch whenever max_concurrent_requests is 1.
+consulate_poll_delay: 2
+
+# Per-request timeout. The site's own TTFB is a few hundred ms, so this only
+# trips on a genuine stall.
+http_timeout: 30
+
+# Consecutive failures on one account before a Telegram alert fires. The bot
+# keeps retrying either way; this only controls when it tells you.
+max_consecutive_failures: 5
+
 # The site intermittently reports a schedule as completed/locked (or an
 # account as holding nothing actionable) when the response is really just a
 # transient glitch. Require "nothing actionable any more" to hold for this
@@ -27,6 +52,70 @@ poll_interval: 300
 # end polling for good. A fully *booked* set still stops immediately, since a
 # booked appointment does not revert.
 done_confirmations: 5
+
+# --- Request efficiency -----------------------------------------------------
+# The site is HTTP/1.1 with no multiplexing, and each round trip costs roughly
+# 200-500ms, so the win comes from making fewer, better-overlapped requests
+# rather than simply polling harder.
+
+# Discovery (the landing page plus one continue_actions page per application)
+# is all HTML, dwarfs days.json, and contains no availability at all. What it
+# reports changes at most once, so it is cached this long instead of being
+# repaid every sweep. Dropped early whenever the answer could really have
+# changed: a booking landed, or the session lapsed.
+discovery_interval: 900
+
+# days.json calls that may be in flight at once. This replaces paying
+# consulate_poll_delay serially between every consulate, which on a few
+# applications turned a handful of 200ms calls into a 20+ second sweep.
+# Each slot is a separate TCP connection, so treat this as a footprint knob.
+# Set to 1 to restore the old strictly-sequential, delayed behaviour.
+max_concurrent_requests: 3
+
+# Collapse availability requests the server itself reports as the same
+# resource. days.json for a given (visa class, consulate) is byte-identical
+# across sibling applications -- the server returns one ETag for all of them --
+# so one request can answer for every member of that class. The grouping is
+# never guessed from this file: it is observed from those ETags at runtime.
+calendar_sharing: true
+# Sweeps between forced re-observation. Every Nth sweep polls each application
+# separately and re-derives the grouping, so a class that stops being identical
+# splits itself back apart on its own. Costs the full request count once per N.
+calendar_reverify_sweeps: 10
+
+# --- Booking speed ----------------------------------------------------------
+# Seconds a pre-fetched booking form stays usable. The appointment page costs a
+# full round trip plus parsing before a single useful byte is sent, and that is
+# exactly the window in which somebody else takes the slot. Holding its
+# authenticity_token and hidden fields ready means a match only pays
+# times.json plus the POST. Refreshed between sweeps, never on the hot path.
+booking_prewarm_ttl: 120
+
+# Fire the POST with a remembered time in parallel with times.json, saving one
+# round trip on a match. Off by default, deliberately: what the site does with
+# a POST naming an unavailable time cannot be established without sending one.
+speculative_booking: false
+
+# --- Adaptive polling -------------------------------------------------------
+# Spend a fixed hourly request budget where it can actually win something.
+# Slots are released during business hours, so polling every few minutes
+# overnight buys nothing that polling fast by day would not.
+#
+# Hours are read AT THE CONSULATE, not on the machine running this. Slots are
+# released by the post, so its business hours are what matter, and Canada spans
+# 4.5 timezones: 08:00 in Toronto is 05:00 in Vancouver. Each post's zone is
+# built in (see app/consulates.py TIMEZONES), so TZ in .env only affects how
+# log timestamps are rendered -- it has no bearing on scheduling.
+#
+# A sweep covers every account at once and cannot be sped up for one consulate
+# alone, so the window counts as open when ANY watched post is inside it.
+#
+# Leave fast_poll_interval at 0 to disable and use poll_interval around clock.
+# active_hours accepts [[9, 17], [20, 22]] or the shorthand "9-17, 20-22";
+# the start hour is inclusive and the end hour exclusive, and a window may
+# wrap midnight (for example [22, 6]).
+fast_poll_interval: 0
+active_hours: []
 
 # A day can show as available in /days.json and then be empty in /times.json
 # a few seconds later -- someone else took the last slot in between. On a
@@ -38,6 +127,14 @@ booking_retry_delay: 2
 
 # Where the app keeps its JSON store (store.json is created inside).
 data_dir: data
+
+# Locale segment used in every URL: ais.usvisa-info.com/{locale}/niv/...
+# Change only if your account lives on a different country site.
+locale: en-ca
+
+# Sent as the User-Agent header. Leave it alone unless you have a reason; a
+# browser-shaped value is the least interesting thing about your traffic.
+# user_agent: ""
 
 # CapSolver key. Only needed when the site decides to arm reCAPTCHA -- it is
 # dormant on a clean session. Without a key an armed challenge fails the login.

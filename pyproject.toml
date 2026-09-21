@@ -16,6 +16,10 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
     "jinja2>=3.1.4",
+    # IANA timezone database. zoneinfo ships in the stdlib but relies on the
+    # host having a tz database, which neither Windows nor python:*-slim does.
+    # Consulate-local hours would silently fail without this.
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]
