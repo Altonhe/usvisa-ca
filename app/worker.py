@@ -709,12 +709,22 @@ class Worker:
         facility_id: int,
         label: str,
     ) -> None:
+        # Route the group's members through the same batched, ETag-deduplicated
+        # fetch the per-application sweep uses. Members of a joint constraint
+        # are usually siblings of one visa class, so the server reports their
+        # calendars as one resource and this collapses to a single request --
+        # and it drops the per-member consulate_poll_delay that made a group
+        # check the slowest part of a sweep.
+        calendars = self._fetch_calendars(
+            account, client, [(member, facility_id) for member in members]
+        )
+
         per_member_days: Dict[str, List[date]] = {}
         any_error = False
         for member in members:
             if self._stop.is_set():
                 return
-            days = client.get_available_days(member, facility_id)
+            days = calendars.get((member, facility_id))
             status = ConsulateStatus(facility_id=facility_id)
             if days is None:
                 status.error = "request failed"
@@ -724,8 +734,6 @@ class Worker:
                 status.earliest = days[0]
             self.store.update_consulate(account.name, member, status)
             per_member_days[member] = days or []
-            if self._stop.wait(self.config.consulate_poll_delay):
-                return
 
         if any_error:
             self._record_group_metric(
