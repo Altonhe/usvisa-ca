@@ -72,16 +72,23 @@ class Form:
 
 
 class Link:
-    """An anchor with its resolved href and collapsed text."""
+    """An anchor with its resolved href, collapsed text and HTTP method.
 
-    __slots__ = ("href", "text")
+    ``method`` comes from Rails UJS ``data-method`` and defaults to ``get``.
+    It matters: on the actions page "Cancel Appointment" and "Reschedule
+    Appointment" point at the *same* href, and only ``data-method="delete"``
+    tells them apart. Following a link must never be allowed to cancel.
+    """
 
-    def __init__(self, href, text):
+    __slots__ = ("href", "text", "method")
+
+    def __init__(self, href, text, method="get"):
         self.href = href
         self.text = text
+        self.method = (method or "get").lower()
 
     def __repr__(self):  # pragma: no cover - debugging aid
-        return f"<Link {self.text!r} -> {self.href!r}>"
+        return f"<Link {self.method.upper()} {self.text!r} -> {self.href!r}>"
 
 
 class Page(HTMLParser):
@@ -90,6 +97,9 @@ class Page(HTMLParser):
     def __init__(self, html: str, base_url: str = ""):
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
+        # Raw markup, kept for the few lookups that need document position
+        # rather than parsed structure (e.g. which card an element sits in).
+        self.html = html
         self.metas: Dict[str, str] = {}
         self.forms: List[Form] = []
         self.links: List[Link] = []
@@ -100,6 +110,7 @@ class Page(HTMLParser):
 
         self._form_stack: List[Form] = []
         self._a_href: Optional[str] = None
+        self._a_method: str = "get"
         self._a_text: List[str] = []
         self._in_title = False
         self._select: Optional[Field] = None
@@ -153,6 +164,7 @@ class Page(HTMLParser):
 
         if tag == "a":
             self._a_href = self._resolve(a.get("href", ""))
+            self._a_method = a.get("data-method") or "get"
             self._a_text = []
             return
 
@@ -198,7 +210,7 @@ class Page(HTMLParser):
             self.forms.append(self._form_stack.pop())
         elif tag == "a" and self._a_href is not None:
             text = " ".join("".join(self._a_text).split())
-            self.links.append(Link(self._a_href, text))
+            self.links.append(Link(self._a_href, text, self._a_method))
             self._a_href = None
             self._a_text = []
         elif tag == "title":

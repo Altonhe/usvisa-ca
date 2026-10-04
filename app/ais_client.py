@@ -31,8 +31,10 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime
+from html import unescape
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlencode
 
 import requests
 
@@ -558,6 +560,9 @@ class AisClient:
             raise AisError("call login() before discover_schedules()")
 
         page = self._get_page(self.landing_url)
+        # The existing appointment is shown on the group page, one card per
+        # application -- not on continue_actions, where it used to be.
+        appointments = appointments_by_schedule(page.html)
         found: List[str] = []
         for link in page.links:
             m = SCHEDULE_LINK_RE.search(link.href)
@@ -593,36 +598,61 @@ class AisClient:
         for index, sid in enumerate(wanted):
             if index and self.request_delay:
                 time.sleep(self.request_delay)
-            schedules.append(self.inspect_schedule(sid))
+            sched = self.inspect_schedule(sid)
+            if not sched.current_appointment and sid in appointments:
+                sched.current_appointment = appointments[sid]
+            schedules.append(sched)
         return schedules
 
     def inspect_schedule(self, schedule_id: str) -> Schedule:
-        """Classify one application by reading its continue_actions page."""
+        """Classify one application by reading its continue_actions page.
+
+        Verified against the live site:
+
+        * never booked -> a GET link to ``.../continue`` labelled
+          "Schedule Appointment";
+        * already booked -> a GET link to ``.../appointment`` labelled
+          "Reschedule Appointment". It does *not* go through ``/continue``,
+          which is why booked applications used to be reported as having no
+          scheduling action at all.
+
+        "Cancel Appointment" points at that same ``.../appointment`` href and
+        is told apart only by ``data-method="delete"``, so non-GET links are
+        never considered, and an ``/appointment`` link must also carry one of
+        the two scheduling labels.
+        """
         page = self._get_page(
             self.continue_actions_url(schedule_id), referer=self.landing_url
         )
         sched = Schedule(id=schedule_id)
-        wanted = f"/niv/schedule/{schedule_id}/continue"
-        for link in page.links:
-            # rstrip/endswith so .../continue_actions is not mistaken for it
-            if link.href.split("?")[0].rstrip("/").endswith(wanted):
-                sched.continue_url = link.href
-                sched.action_label = link.text
-                break
+        sched.continue_url, sched.action_label = find_schedule_action(
+            page.links, schedule_id
+        )
         m = CONSULAR_APPT_RE.search(page.text)
         if m:
             sched.current_appointment = m.group(1)
         return sched
 
     def current_appointment(self, schedule_id: str) -> Optional[str]:
-        """The appointment date the site currently shows, if any."""
+        """The appointment date the site currently shows, if any.
+
+        Read from the group page (where the site shows it now), falling back
+        to continue_actions for the older layout.
+        """
         try:
+            if self.landing_url:
+                found = appointments_by_schedule(
+                    self._get_page(self.landing_url).html
+                ).get(schedule_id)
+                if found:
+                    return found
             page = self._get_page(self.continue_actions_url(schedule_id))
-        except requests.RequestException as exc:
+        except (requests.RequestException, AisError) as exc:
             self._log(f"could not re-read schedule {schedule_id}: {exc}")
             return None
         m = CONSULAR_APPT_RE.search(page.text)
         return m.group(1) if m else None
+
 
     # -- availability ----------------------------------------------------
 
@@ -684,24 +714,45 @@ class AisClient:
     def open_appointment_page(self, schedule_id: str) -> Page:
         """Reach the appointment form, clearing any interstitial on the way.
 
-        Rescheduling shows a "you may only reschedule N times" consent page
-        before the form; it is acknowledged automatically.
+        Entered through ``.../appointment`` directly, which is what the site
+        links to for both first-time and reschedule actions. ``.../continue``
+        is kept only as a fallback: for an already-booked application it now
+        redirects to the instructions page, which has no form at all.
+
+        A reschedule first shows the "Scheduling Limit Warning" (a GET form
+        with a ``confirmed_limit_message`` checkbox). Acknowledging it is a
+        plain GET and does not use up a reschedule -- only the final POST does.
         """
-        page = self._get_page(
-            self.schedule_continue_url(schedule_id),
-            referer=self.continue_actions_url(schedule_id),
-        )
-        for _ in range(3):
-            if page.form_by_id("appointment-form") is not None:
-                return page
-            nxt = self._clear_interstitial(page)
-            if nxt is None:
-                break
-            page = nxt
+        for entry in (self.appointment_url(schedule_id),
+                      self.schedule_continue_url(schedule_id)):
+            page = self._get_page(
+                entry, referer=self.continue_actions_url(schedule_id)
+            )
+            for _ in range(3):
+                if page.form_by_id("appointment-form") is not None:
+                    return page
+                nxt = self._clear_interstitial(page)
+                if nxt is None:
+                    break
+                page = nxt
         raise AisError(f"could not reach appointment-form for schedule {schedule_id}")
 
     def _clear_interstitial(self, page: Page) -> Optional[Page]:
         """Acknowledge a consent page and return whatever comes next."""
+        # The reschedule limit warning: a GET form, acknowledged by GET.
+        for form in page.forms:
+            if form.method != "get" or not form.action:
+                continue
+            if not any(f.name == "confirmed_limit_message" for f in form.fields):
+                continue
+            params = form.payload()
+            params["confirmed_limit_message"] = "1"
+            self._log("acknowledging scheduling limit warning")
+            return self._get_page(
+                form.action + "?" + urlencode(params),
+                referer=page.base_url or form.action,
+            )
+
         target = None
         for form in page.forms:
             if form.method != "post" or not form.action:
@@ -725,6 +776,7 @@ class AisClient:
         self._log("acknowledging interstitial consent page")
         resp = self._post_form(target.action, payload, page)
         return Page(resp.text, base_url=resp.url)
+
 
     def prewarm_booking(self, schedule_id: str, force: bool = False,
                         ttl: float = 120.0) -> Optional[PrewarmedForm]:
@@ -1000,3 +1052,53 @@ def parse_site_date(text: str) -> Optional[date]:
         except ValueError:
             continue
     return None
+
+
+
+ACTION_LABELS = (FIRST_TIME_LABEL, RESCHEDULE_LABEL)
+
+
+def find_schedule_action(links, schedule_id: str) -> Tuple[str, str]:
+    """Return ``(href, label)`` of the scheduling action, or ``("", "")``.
+
+    Only GET links count: "Cancel Appointment" shares the ``/appointment``
+    href and differs solely by ``data-method="delete"``.
+    """
+    base = f"/niv/schedule/{schedule_id}"
+    for link in links:
+        if getattr(link, "method", "get") != "get" or not link.href:
+            continue
+        path = link.href.split("?")[0].rstrip("/")
+        label = " ".join(link.text.split()).lower()
+        if path.endswith(f"{base}/continue"):
+            return link.href, link.text
+        if path.endswith(f"{base}/appointment") and label in ACTION_LABELS:
+            return link.href, link.text
+    return "", ""
+
+
+_CARD_START = re.compile(r'(?=<div[^>]*class="[^"]*\bapplication\b)')
+_TAG = re.compile(r"<[^>]+>")
+
+
+def appointments_by_schedule(html: str) -> Dict[str, str]:
+    """``schedule_id -> "1 November, 2027"`` read off the group page.
+
+    Each application is its own card holding its continue_actions link and,
+    once booked, a ``<p class="consular-appt">`` line. Splitting on the card
+    keeps one applicant's date from being attributed to another; a chunk is
+    only trusted when it names exactly one schedule.
+    """
+    out: Dict[str, str] = {}
+    if not html:
+        return out
+    for chunk in _CARD_START.split(html):
+        ids = set(SCHEDULE_LINK_RE.findall(chunk))
+        if len(ids) != 1:
+            continue
+        text = " ".join(unescape(_TAG.sub(" ", chunk)).split())
+        text = text.replace(" :", ":")
+        m = CONSULAR_APPT_RE.search(text)
+        if m:
+            out[ids.pop()] = m.group(1)
+    return out
