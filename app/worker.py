@@ -745,6 +745,22 @@ class Worker:
         common = sorted(set.intersection(*(set(d) for d in per_member_days.values())))
         common = [d for d in common if group.target.accepts(d)]
 
+        # Every member lands on the same day, so that day must be earlier than
+        # each member's existing appointment. A member whose current date is
+        # unreadable blocks the move entirely rather than risk moving it later.
+        group_ceiling: Optional[date] = None
+        group_blocked = False
+        for member in members:
+            ok, ceiling = self._booking_ceiling(by_id[member][1] if member in by_id else None)
+            if not ok:
+                group_blocked = True
+            elif ceiling is not None:
+                group_ceiling = ceiling if group_ceiling is None else min(group_ceiling, ceiling)
+        if group_blocked:
+            common = []
+        elif group_ceiling is not None:
+            common = [d for d in common if d < group_ceiling]
+
         per_member_earliest = {
             m: (min(days) if days else None) for m, days in per_member_days.items()
         }
@@ -814,11 +830,11 @@ class Worker:
             f"@ {day} ({total_slots} slot(s) available)"
         )
         for i, member in enumerate(members):
-            app, _ = by_id[member]
+            app, member_schedule = by_id[member]
             candidate_times = per_member_times[member] or pool
             time_value = candidate_times[min(i, len(candidate_times) - 1)]
             slot = Slot(member, facility_id, day, time=time_value)
-            self._attempt_booking(account, client, app, slot)
+            self._attempt_booking(account, client, app, slot, member_schedule)
 
     def _record_group_metric(
         self,
@@ -933,9 +949,16 @@ class Worker:
             )
             return
 
+        can_book, ceiling = self._booking_ceiling(schedule)
+        only_earlier = ""
+        if not can_book:
+            only_earlier = " (reschedule, but current appointment date unreadable: will not book)"
+        elif ceiling is not None:
+            only_earlier = f" (currently booked {ceiling}: only earlier days)"
         self.log(
             f"[{account.name}] {app.display_name}: checking "
             f"{target.describe_consulates()} for {target.describe_window()}"
+            f"{only_earlier}"
         )
 
         candidates: List[Slot] = []
@@ -960,7 +983,12 @@ class Worker:
             else:
                 status.total_days = len(days)
                 status.earliest = days[0]
-                acceptable = [d for d in days if target.accepts(d)]
+                in_window = [d for d in days if target.accepts(d)]
+                acceptable = in_window
+                if not can_book:
+                    acceptable = []
+                elif ceiling is not None:
+                    acceptable = [d for d in in_window if d < ceiling]
                 status.acceptable_count = len(acceptable)
                 if acceptable:
                     status.earliest_acceptable = acceptable[0]
@@ -971,6 +999,10 @@ class Worker:
                 detail = f"{len(days)} day(s), earliest {days[0]}"
                 if acceptable:
                     detail += f" | {len(acceptable)} acceptable, earliest {acceptable[0]}"
+                elif in_window and not can_book:
+                    detail += " | in window, but current appointment date unknown"
+                elif in_window and ceiling is not None:
+                    detail += f" | in window, but not earlier than current {ceiling}"
                 else:
                     blocked = target.excluded_by(days[0])
                     detail += (
@@ -1001,7 +1033,29 @@ class Worker:
 
         slot = self._pick(candidates, target)
         self.log(f"[{account.name}] {app.display_name}: MATCH {slot}")
-        self._attempt_booking(account, client, app, slot)
+        self._attempt_booking(account, client, app, slot, schedule)
+
+    @staticmethod
+    def _booking_ceiling(schedule: Optional[Schedule]) -> Tuple[bool, Optional[date]]:
+        """How far an application may be moved, given its current appointment.
+
+        Returns ``(allowed, ceiling)``:
+
+        * ``(True, None)`` -- no existing appointment, any acceptable day will do.
+        * ``(True, d)`` -- already booked on ``d``: only days strictly before
+          ``d`` count. A reschedule must never move an appointment later, and
+          each one spends one of the limited reschedules the site allows.
+        * ``(False, None)`` -- a reschedule whose current date could not be
+          read. We cannot prove a move would be earlier, so we do not move it.
+        """
+        if schedule is None:
+            return True, None
+        current = parse_site_date(schedule.current_appointment or "")
+        if current is not None:
+            return True, current
+        if schedule.is_reschedule:
+            return False, None
+        return True, None
 
     @staticmethod
     def _pick(candidates: List[Slot], target: Target) -> Slot:
@@ -1011,8 +1065,23 @@ class Worker:
         return candidates[0]
 
     def _attempt_booking(
-        self, account: Account, client: AisClient, app: Application, slot: Slot
+        self, account: Account, client: AisClient, app: Application, slot: Slot,
+        schedule: Optional[Schedule] = None,
     ) -> None:
+        # Last line of defence before anything is POSTed: whatever path got us
+        # here, an existing appointment is only ever moved earlier.
+        can_book, ceiling = self._booking_ceiling(schedule)
+        if not can_book or (ceiling is not None and slot.day >= ceiling):
+            reason = (
+                "current appointment date unreadable"
+                if not can_book
+                else f"{slot.day} is not earlier than current {ceiling}"
+            )
+            self.log(f"[{account.name}] {app.display_name}: not rescheduling, {reason}")
+            self.store.update_application(
+                account.name, app.schedule_id, message=f"not rescheduled: {reason}"
+            )
+            return
         # Notified *after* the booking attempt, not before: the site can take
         # the last slot on this day within seconds, so nothing should sit
         # between the match and the booking request itself. The Telegram
