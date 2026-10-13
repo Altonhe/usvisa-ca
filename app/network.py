@@ -62,6 +62,9 @@ class NetworkConfig:
     switch_timeout: int = 60
     # Seconds the whole pool pauses when no egress works at all.
     pause_on_ip_ban: int = 300
+    # After a direct fallback, how often (seconds) to check whether the VPN
+    # works again and move traffic back onto it.
+    vpn_retry_interval: int = 300
     # Per-request timeout for the probe and the control API.
     timeout: int = 15
 
@@ -107,6 +110,8 @@ class NetworkGuard:
         # "vpn" when routing through config.proxy, "direct" after a fallback.
         self._mode = "vpn" if config.proxy else "direct"
         self._paused_until = 0.0
+        # Monotonic time of the next "is the VPN back?" check while direct.
+        self._next_vpn_retry = 0.0
         self.last_probe: Optional[ProbeResult] = None
         self.last_verdict = ""          # "account" | "ip" | "maintenance"
         self.ip_bans = 0
@@ -138,6 +143,82 @@ class NetworkGuard:
 
     def pause_left(self) -> int:
         return max(0, int(self._paused_until - time.monotonic()))
+
+    def check_paused(self, should_stop: Callable[[], bool] = lambda: False) -> bool:
+        """While paused, look for a working egress instead of just waiting.
+
+        One unauthenticated probe of the current egress -- no account is
+        touched. If the site answers, the pause is lifted at once. If not, the
+        provider is stepped to its next profile (one per call, so a sweep stays
+        short) and that is probed. Returns True when the pool may run again.
+        """
+        if not self.paused():
+            return True
+        if not self._recovering.acquire(blocking=False):
+            return False
+        try:
+            result = self.probe()
+            if result.verdict == MAINTENANCE:
+                return False  # nothing an egress change can fix
+            if not result.ok and self.config.provider_enabled and self.config.proxy:
+                if self._rotate(should_stop, limit=1):
+                    result = self.last_probe or result
+            if not result.ok and self._try_direct():
+                result = self.last_probe or result
+            if result.ok:
+                self._paused_until = 0.0
+                self._log("network: egress works again; resuming the pool")
+                self._record("resumed", mode=self._mode, detail=result.detail)
+                return True
+            return False
+        finally:
+            self._recovering.release()
+
+    def maybe_return_to_vpn(self, should_stop: Callable[[], bool] = lambda: False) -> bool:
+        """While on a direct fallback, move back to the VPN once it works.
+
+        Checked at most every ``vpn_retry_interval`` seconds: the current
+        profile is probed through the proxy, and if it is refused the provider
+        is stepped to the next profile and that is probed. Returns True when
+        traffic was moved back onto the VPN.
+        """
+        if self._mode != "direct" or not self.config.proxy:
+            return False
+        now = time.monotonic()
+        if now < self._next_vpn_retry:
+            return False
+        self._next_vpn_retry = now + max(1, self.config.vpn_retry_interval)
+        if not self._recovering.acquire(blocking=False):
+            return False
+        try:
+            vpn = {"http": self.config.proxy, "https": self.config.proxy}
+            result = self.probe(proxies=vpn)
+            if not result.ok and self.config.provider_enabled:
+                # _rotate sets the mode back to "vpn" on success.
+                if not self._rotate(should_stop, limit=1):
+                    self._record("vpn-still-down", detail=result.detail)
+                    return False
+            elif not result.ok:
+                return False
+            self._mode = "vpn"
+            self._log("network: the VPN works again; moving traffic back off the direct connection")
+            self._record("back-to-vpn", detail=(self.last_probe or result).detail)
+            return True
+        finally:
+            self._recovering.release()
+
+    def _try_direct(self) -> bool:
+        """Switch to the host's own address if allowed and the site takes it."""
+        if not (self.config.direct_fallback and self._mode == "vpn" and self.config.proxy):
+            return False
+        result = self.probe(proxies={})
+        if not result.ok:
+            return False
+        self._mode = "direct"
+        self._next_vpn_retry = time.monotonic() + max(1, self.config.vpn_retry_interval)
+        self._log("network: every VPN profile is refused; using the direct connection")
+        self._record("fallback", mode="direct", detail=result.detail)
+        return True
 
     # -- probing -----------------------------------------------------------
 
@@ -192,11 +273,7 @@ class NetworkGuard:
                 if self._rotate(should_stop):
                     return True
             if self.config.direct_fallback and self._mode == "vpn":
-                result = self.probe(proxies={})
-                if result.ok:
-                    self._mode = "direct"
-                    self._log("network: every VPN profile is refused; using the direct connection")
-                    self._record("fallback", mode="direct", detail=result.detail)
+                if self._try_direct():
                     return True
             elif self._mode == "direct" and self.config.proxy:
                 # A previous fallback put us on the host IP, which is now
@@ -212,7 +289,7 @@ class NetworkGuard:
         finally:
             self._recovering.release()
 
-    def _rotate(self, should_stop: Callable[[], bool]) -> bool:
+    def _rotate(self, should_stop: Callable[[], bool], limit: Optional[int] = None) -> bool:
         try:
             status = self.provider_status()
             profiles = self.profiles()
@@ -227,6 +304,8 @@ class NetworkGuard:
         active = status.get("activeProfile") or ""
         start = profiles.index(active) if active in profiles else -1
         order = [profiles[(start + i) % len(profiles)] for i in range(1, len(profiles) + 1)]
+        if limit is not None:
+            order = order[:limit]
         for profile in order:
             if should_stop():
                 return False
@@ -295,8 +374,9 @@ class NetworkGuard:
         body = self._provider("POST", "/switch", payload)
         self._record("manual-switch" if not self._recovering.locked() else "switch",
                      profile=profile or "random")
-        # A manual switch is an explicit choice of the VPN route.
-        if self.config.proxy:
+        # A manual switch is an explicit choice of the VPN route. Automatic
+        # rotation decides the mode itself, only once a profile is accepted.
+        if self.config.proxy and not self._recovering.locked():
             self._mode = "vpn"
         return body
 

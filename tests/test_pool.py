@@ -2,8 +2,9 @@
 
 Every account -- canary or subscriber -- is one pool. A calendar is asked once
 per (visa class, consulate), preferably by a canary, and spread over whoever
-can answer it. A declared visa_type is verified from ETags and corrected on its
-own; a failing account rests and the rest of the pool covers for it.
+can answer it. A declared visa_type is trusted as is; a hit read from another
+schedule_id is confirmed on the subscriber's own account before booking. A
+failing account rests and the rest of the pool covers for it.
 """
 
 import threading
@@ -43,75 +44,36 @@ def answer(planner, plan, etags):
     return results
 
 
-def test_typed_class_is_verified_before_it_is_shared():
+def test_declared_class_is_shared_from_the_first_sweep():
     planner = CalendarPlanner(reverify_sweeps=100)
     canary = Poller("C", "900", "B2", canary=True)
     wanted = subs(("A", "1", TRT, "B2"), ("B", "2", TRT, "B2"))
 
-    first = planner.plan(wanted, [canary], sweep=1)
-    kinds = sorted(p.kind for p in first.polls)
-    assert kinds == ["solo", "solo", "verify"], "each member + canary on its own"
-    answer(planner, first, {"1": B2, "2": B2, "900": B2})
-
-    second = planner.plan(wanted, [canary], sweep=2)
-    assert len(second.polls) == 1
-    poll = second.polls[0]
-    assert poll.poller.canary, "a verified canary is preferred"
+    plan = planner.plan(wanted, [canary], sweep=1)
+    assert len(plan.polls) == 1, "no verification round: the config is trusted"
+    poll = plan.polls[0]
+    assert poll.poller.canary, "a same-type canary is preferred"
     assert set(poll.covers) == {"1", "2"}
     assert [c.account for c in poll.candidates] == ["C", "A", "B"], \
         "subscribers stay behind the canary as fallbacks"
 
 
-def test_mismatched_canary_is_dropped_not_escalated():
-    planner = CalendarPlanner(reverify_sweeps=100)
+def test_etag_disagreement_never_splits_a_declared_class():
+    planner = CalendarPlanner(reverify_sweeps=5)
     canary = Poller("C", "900", "B2", canary=True)
     wanted = subs(("A", "1", TRT, "B2"), ("B", "2", TRT, "B2"))
-
-    answer(planner, planner.plan(wanted, [canary], 1),
-           {"1": B2, "2": B2, "900": F1})       # the canary is really F1
-    assert planner.canary_state("900", TRT) is False
-
-    second = planner.plan(wanted, [canary], 2)
-    assert len(second.polls) == 1
-    assert not second.polls[0].poller.canary
-    assert all(not c.canary for c in second.polls[0].candidates)
-
-
-def test_member_with_a_wrong_visa_type_is_polled_by_its_own_account():
-    planner = CalendarPlanner(reverify_sweeps=100)
-    wanted = subs(("A", "1", TRT, "B2"), ("A", "2", TRT, "B2"),
-                  ("B", "3", TRT, "B2"))
-    answer(planner, planner.plan(wanted, [], 1),
-           {"1": B2, "2": B2, "3": F1})        # 3 was mislabelled
-    assert planner.is_diverged("3", TRT)
-
-    second = planner.plan(wanted, [], 2)
-    covers = sorted(sorted(p.covers) for p in second.polls)
-    assert covers == [["1", "2"], ["3"]]
-    solo = next(p for p in second.polls if p.covers == ("3",))
-    assert solo.poller.account == "B", "its own account asks for it"
-
-
-def test_diverged_member_rejoins_after_a_reverify_that_agrees():
-    planner = CalendarPlanner(reverify_sweeps=5)
-    wanted = subs(("A", "1", TRT, "B2"), ("A", "2", TRT, "B2"),
-                  ("B", "3", TRT, "B2"))
-    answer(planner, planner.plan(wanted, [], 1), {"1": B2, "2": B2, "3": F1})
-    assert planner.is_diverged("3", TRT)
-
-    answer(planner, planner.plan(wanted, [], 5), {"1": B2, "2": B2, "3": B2})
-    assert not planner.is_diverged("3", TRT)
-    assert len(planner.plan(wanted, [], 6).polls) == 1
+    for n in range(1, 11):                     # includes re-verify sweeps
+        plan = planner.plan(wanted, [canary], n)
+        assert len(plan.polls) == 1
+        assert plan.polls[0].poller.canary
+        answer(planner, plan, {"900": F1})     # the canary "is really F1"
 
 
 def test_requests_spread_over_canaries():
     planner = CalendarPlanner(reverify_sweeps=100)
     canaries = [Poller("C1", "901", "B2", True), Poller("C2", "902", "B2", True)]
     wanted = subs(("A", "1", TRT, "B2"), ("A", "1", VAN, "B2"))
-    answer(planner, planner.plan(wanted, canaries, 1),
-           {"1": B2, "901": B2, "902": B2})
-
-    plan = planner.plan(wanted, canaries, 2)
+    plan = planner.plan(wanted, canaries, 1)
     assert sorted(p.poller.account for p in plan.polls) == ["C1", "C2"]
 
 
@@ -233,15 +195,33 @@ def test_canary_carries_the_polling_and_the_subscriber_books(tmp_path):
     worker = build(tmp_path, [subscriber("A", "111"), canary("C", "900")],
                    {"A": sub, "C": can})
 
-    sweep(worker, 1)                       # verification sweep
-    sub.calls.clear(); can.calls.clear(); sub.booked.clear()
-
-    sweep(worker, 2)
-    assert sub.calls == [], "the subscriber's own account no longer polls"
-    assert can.calls == [("900", TRT)]
+    sweep(worker, 1)
+    assert can.calls == [("900", TRT)], "the canary polls from the first sweep"
+    assert sub.calls == [("111", TRT)], "the subscriber asks only to confirm the hit"
     assert [s.schedule_id for s in sub.booked] == ["111"], \
         "booking still happens on the subscriber's own session"
     assert sub.booked[0].day == DAY
+
+
+def test_quiet_canary_costs_the_subscriber_nothing(tmp_path):
+    sub = PoolClient(["111"], {"111": B2})
+    can = PoolClient(["900"], {"900": F1})    # answers with no days
+    worker = build(tmp_path, [subscriber("A", "111"), canary("C", "900")],
+                   {"A": sub, "C": can})
+    sweep(worker, 1)
+    sweep(worker, 2)
+    assert sub.calls == [], "nothing to confirm, so the subscriber never polls"
+    assert len(can.calls) == 2
+
+
+def test_canary_hit_the_subscriber_cannot_see_is_not_booked(tmp_path):
+    sub = PoolClient(["111"], {"111": F1})    # its own calendar: nothing
+    can = PoolClient(["900"], {"900": B2})    # canary reports DAY
+    worker = build(tmp_path, [subscriber("A", "111"), canary("C", "900")],
+                   {"A": sub, "C": can})
+    sweep(worker, 1)
+    assert sub.calls == [("111", TRT)], "the hit was re-read on the own account"
+    assert sub.booked == [], "and the subscriber's own answer decided"
 
 
 def test_canary_is_not_shown_as_an_application(tmp_path):
@@ -252,19 +232,6 @@ def test_canary_is_not_shown_as_an_application(tmp_path):
     snap = {a["name"]: a for a in worker.store.snapshot()["accounts"]}
     assert snap["C"]["applications"] == []
     assert [a["schedule_id"] for a in snap["A"]["applications"]] == ["111"]
-
-
-def test_wrong_canary_falls_back_to_the_subscriber(tmp_path):
-    sub = PoolClient(["111"], {"111": B2})
-    can = PoolClient(["900"], {"900": F1})    # declared B2, really F1
-    worker = build(tmp_path, [subscriber("A", "111"), canary("C", "900")],
-                   {"A": sub, "C": can})
-    sweep(worker, 1)
-    sub.calls.clear(); can.calls.clear()
-
-    sweep(worker, 2)
-    assert can.calls == []
-    assert sub.calls == [("111", TRT)]
 
 
 def test_failed_canary_request_fails_over_to_another_account(tmp_path):

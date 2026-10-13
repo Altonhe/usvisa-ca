@@ -29,20 +29,22 @@ sources of class membership are used:
   application you are trying to book -- be matched to a requirement at all.
 * ETags observed at runtime, for applications that declare no type.
 
-A declared type is a claim, not evidence, so it is checked. A typed class is
-**verified** before it is ever shared and again every ``reverify_sweeps``
-sweeps: each member and each canary asks on its own in the same sweep and the
-ETags are compared. Anything that disagrees with the majority of the members
-is not reported or escalated -- it is simply taken out of the class and polled
-by its own account from then on, until the next verification says it agrees
-again. A wrong ``visa_type`` therefore costs requests, never a missed slot.
+A declared ``visa_type`` is authoritative: every member and every canary of
+that type shares one request from the first sweep on, and ETags are never used
+to second-guess it. Instead, a hit read from someone else's answer is
+confirmed by the subscriber's own account (its own ``days.json``) before it is
+booked -- see :meth:`app.worker.Worker._confirm_days`. A wrong ``visa_type``
+can therefore never cause a wrong booking; what it can cost is visibility, if
+the poller's calendar lacks days the subscriber's would have shown.
+
+Applications with no declared type share only on ETag evidence, re-checked
+every ``reverify_sweeps`` sweeps.
 """
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -79,7 +81,7 @@ class Poll:
     candidates: List[Poller]
     # Subscriber schedule_ids this request answers for.
     covers: Tuple[str, ...]
-    # "shared" | "solo" | "verify" (a verification probe answers no one).
+    # "shared" | "solo".
     kind: str = "shared"
     # Human-readable class label, for the log.
     label: str = ""
@@ -98,19 +100,8 @@ class PollResult:
 
 
 @dataclass
-class _Verification:
-    """A typed class being checked this sweep."""
-
-    visa_type: str
-    facility_id: int
-    members: List[str]
-    canaries: List[str]
-
-
-@dataclass
 class SweepPlan:
     polls: List[Poll] = field(default_factory=list)
-    verifications: List[_Verification] = field(default_factory=list)
     subscriptions: int = 0
 
     def load(self) -> Dict[str, int]:
@@ -147,15 +138,8 @@ class CalendarPlanner:
         self.reverify_sweeps = reverify_sweeps
         self._log = logger or (lambda m: None)
         # (schedule_id, facility_id) -> last ETag seen for that calendar.
+        # Only the untyped path decides anything from it.
         self._etags: Dict[Tuple[str, int], str] = {}
-        # Typed subscriptions whose calendar disagreed with their declared
-        # class at the last verification. Polled on their own until the next.
-        self._diverged: Set[Tuple[str, int]] = set()
-        # (canary schedule_id, facility_id) -> True agrees / False disagrees.
-        # Missing means "not verified yet", which is never shared on.
-        self._canary_ok: Dict[Tuple[str, int], bool] = {}
-        # (visa_type, facility_id) whose members were verified this epoch.
-        self._verified: Set[Tuple[str, int]] = set()
 
     # -- queries ---------------------------------------------------------
 
@@ -167,24 +151,13 @@ class CalendarPlanner:
     def known_etag(self, schedule_id: str, facility_id: int) -> Optional[str]:
         return self._etags.get((schedule_id, facility_id))
 
-    def is_diverged(self, schedule_id: str, facility_id: int) -> bool:
-        return (schedule_id, facility_id) in self._diverged
-
-    def canary_state(self, schedule_id: str, facility_id: int) -> Optional[bool]:
-        return self._canary_ok.get((schedule_id, facility_id))
-
     def forget(self, schedule_id: Optional[str] = None) -> None:
         """Drop learned state, entirely or for one schedule_id."""
         if schedule_id is None:
             self._etags.clear()
-            self._diverged.clear()
-            self._canary_ok.clear()
-            self._verified.clear()
             return
-        for store in (self._etags, self._canary_ok):
-            for key in [k for k in store if k[0] == schedule_id]:
-                del store[key]
-        self._diverged = {k for k in self._diverged if k[0] != schedule_id}
+        for key in [k for k in self._etags if k[0] == schedule_id]:
+            del self._etags[key]
 
     # -- planning --------------------------------------------------------
 
@@ -205,9 +178,6 @@ class CalendarPlanner:
             return out
 
         reverify = self.is_reverify_sweep(sweep)
-        if reverify:
-            # A new epoch: every class must earn its sharing again.
-            self._verified.clear()
 
         load: Dict[str, int] = {}
         by_facility: Dict[int, List[Subscription]] = {}
@@ -224,9 +194,7 @@ class CalendarPlanner:
                     rest.append(sub)
 
             for visa_type, group in typed.items():
-                rest.extend(self._plan_typed(
-                    visa_type, fid, group, canaries, reverify, load, out,
-                ))
+                self._plan_typed(visa_type, fid, group, canaries, load, out)
 
             self._plan_by_etag(fid, rest, canaries, reverify, load, out)
 
@@ -238,62 +206,27 @@ class CalendarPlanner:
         fid: int,
         group: List[Subscription],
         canaries: Sequence[Poller],
-        reverify: bool,
         load: Dict[str, int],
         out: SweepPlan,
-    ) -> List[Subscription]:
-        """Plan one declared class at one consulate.
+    ) -> None:
+        """One declared class at one consulate: one request, trusted as is.
 
-        Returns the members that are NOT covered here (diverged ones), for
-        the ETag-based path to handle.
+        Same-type canaries are asked first, then the members themselves as
+        fallbacks. No ETag comparison: the config is the source of truth, and
+        a hit is confirmed by the subscriber's own account before booking.
         """
         same_type = [c for c in canaries if c.visa_type == visa_type]
-        key = (visa_type, fid)
-        unverified_canary = any(
-            (c.schedule_id, fid) not in self._canary_ok for c in same_type
-        )
-        worth_verifying = len(group) > 1 or bool(same_type)
-        if worth_verifying and (
-            reverify or key not in self._verified or unverified_canary
-        ):
-            # Everyone answers for themselves this sweep, and the canaries are
-            # asked alongside so their ETag is compared at the same moment.
-            for sub in group:
-                out.polls.append(self._solo(sub, kind="solo", label=visa_type))
-                _bump(load, sub.account)
-            for canary in _least_loaded(same_type, load):
-                out.polls.append(Poll(
-                    facility_id=fid, candidates=[canary], covers=(),
-                    kind="verify", label=visa_type,
-                ))
-                _bump(load, canary.account)
-            out.verifications.append(_Verification(
-                visa_type=visa_type, facility_id=fid,
-                members=[s.schedule_id for s in group],
-                canaries=[c.schedule_id for c in same_type],
-            ))
-            return []
-
-        agreeing = [s for s in group if (s.schedule_id, fid) not in self._diverged]
-        diverged = [s for s in group if (s.schedule_id, fid) in self._diverged]
-        if not agreeing:
-            return diverged
-
-        good_canaries = [
-            c for c in same_type if self._canary_ok.get((c.schedule_id, fid))
-        ]
         candidates = (
-            _least_loaded(good_canaries, load)
-            + _least_loaded([s.poller for s in agreeing], load)
+            _least_loaded(same_type, load)
+            + _least_loaded([s.poller for s in group], load)
         )
         out.polls.append(Poll(
             facility_id=fid, candidates=candidates,
-            covers=tuple(s.schedule_id for s in agreeing),
-            kind="shared" if len(agreeing) > 1 or good_canaries else "solo",
+            covers=tuple(s.schedule_id for s in group),
+            kind="shared" if len(candidates) > 1 else "solo",
             label=visa_type,
         ))
         _bump(load, candidates[0].account)
-        return diverged
 
     def _plan_by_etag(
         self,
@@ -304,7 +237,7 @@ class CalendarPlanner:
         load: Dict[str, int],
         out: SweepPlan,
     ) -> None:
-        """Untyped (or diverged) subscriptions: share only on ETag evidence."""
+        """Untyped subscriptions: share only on ETag evidence."""
         if reverify:
             for sub in subs:
                 out.polls.append(self._solo(sub))
@@ -326,7 +259,6 @@ class CalendarPlanner:
             matching = [
                 c for c in canaries
                 if self._etags.get((c.schedule_id, fid)) == etag
-                and self._canary_ok.get((c.schedule_id, fid), True)
             ]
             candidates = (
                 _least_loaded(matching, load)
@@ -353,7 +285,7 @@ class CalendarPlanner:
     # -- learning --------------------------------------------------------
 
     def observe(self, plan: SweepPlan, results: Iterable[PollResult]) -> None:
-        """Learn ETags from this sweep and settle any verifications."""
+        """Learn ETags from this sweep (only the untyped path uses them)."""
         results = list(results)
         for res in results:
             if res.poller is None or res.days is None or not res.etag:
@@ -366,58 +298,6 @@ class CalendarPlanner:
             for sid in res.poll.covers:
                 self._etags[(sid, fid)] = res.etag
 
-        for check in plan.verifications:
-            self._settle(check)
-
-    def _settle(self, check: _Verification) -> None:
-        fid = check.facility_id
-        seen = {
-            sid: self._etags.get((sid, fid)) for sid in check.members
-        }
-        votes = Counter(e for e in seen.values() if e)
-        if not votes:
-            return  # every member failed: nothing learned, retry next sweep
-
-        top = votes.most_common()
-        reference = top[0][0]
-        if len(top) > 1 and top[0][1] == top[1][1]:
-            # A tie among members: let a canary that matches one side decide.
-            tied = {e for e, n in top if n == top[0][1]}
-            for csid in check.canaries:
-                etag = self._etags.get((csid, fid))
-                if etag in tied:
-                    reference = etag
-                    break
-
-        for sid, etag in seen.items():
-            if etag is None:
-                continue
-            if etag != reference:
-                if (sid, fid) not in self._diverged:
-                    self._log(
-                        f"{sid} @ facility {fid}: calendar differs from the rest "
-                        f"of {check.visa_type}; it will be polled by its own "
-                        "account until the next re-verify"
-                    )
-                self._diverged.add((sid, fid))
-            else:
-                self._diverged.discard((sid, fid))
-
-        for csid in check.canaries:
-            etag = self._etags.get((csid, fid))
-            if etag is None:
-                continue  # its request failed: stays unverified
-            ok = etag == reference
-            if self._canary_ok.get((csid, fid)) is not ok:
-                self._log(
-                    f"canary {csid} @ facility {fid}: "
-                    + ("matches " if ok else "does NOT match ")
-                    + f"{check.visa_type}"
-                    + ("" if ok else "; not used for it until the next re-verify")
-                )
-            self._canary_ok[(csid, fid)] = ok
-
-        self._verified.add((check.visa_type, fid))
 
 
 # -- helpers ---------------------------------------------------------------

@@ -102,6 +102,9 @@ class Worker:
         self._cooldown_until: Dict[str, float] = {}
         # account -> availability requests it made in the last sweep.
         self._last_load: Dict[str, int] = {}
+        # (subscriber schedule_id, facility_id) -> schedule_id whose answer it
+        # was given this sweep. A hit on one is re-read by the subscriber.
+        self._borrowed: Dict[Tuple[str, int], str] = {}
         # Consecutive sweeps that saw "nothing actionable any more". The site
         # intermittently reports a schedule as completed/locked when it is
         # really just a bad response, so we require this to hold for several
@@ -480,10 +483,13 @@ class Worker:
         talked = False
 
         if self.network is not None:
-            if self.network.paused():
+            self.network.maybe_return_to_vpn(self._stop.is_set)
+            if self.network.paused() and not self.network.check_paused(
+                self._stop.is_set
+            ):
                 self.log(
-                    "network: no working egress, pool paused for another "
-                    f"{self.network.pause_left()}s"
+                    "network: still no working egress (probe failed, tried the "
+                    f"next profile); pool paused for up to {self.network.pause_left()}s more"
                 )
                 return
             for cached in self._clients.values():
@@ -696,16 +702,64 @@ class Worker:
         stats = {name: (c[0], c[1]) for name, c in counts.items()}
         return results, stats, errors
 
-    @staticmethod
     def _fan_out(
-        results: List[PollResult],
+        self, results: List[PollResult],
     ) -> Dict[Tuple[str, int], Optional[List[date]]]:
-        """``(schedule_id, facility_id) -> days`` for every subscriber covered."""
+        """``(schedule_id, facility_id) -> days`` for every subscriber covered.
+
+        Answers a subscriber got from another schedule_id on the strength of a
+        declared ``visa_type`` (a canary, or a sibling) are remembered in
+        ``_borrowed`` so a hit on them is confirmed by the subscriber itself
+        before booking.
+        """
         calendars: Dict[Tuple[str, int], Optional[List[date]]] = {}
         for res in results:
             for schedule_id in res.poll.covers:
-                calendars[(schedule_id, res.poll.facility_id)] = res.days
+                key = (schedule_id, res.poll.facility_id)
+                calendars[key] = res.days
+                # Only sharing that rests on a declared visa_type is unproven;
+                # ETag-matched sharing already showed the calendar is identical.
+                if (
+                    res.poll.label
+                    and res.poller is not None
+                    and res.poller.schedule_id != schedule_id
+                ):
+                    self._borrowed[key] = res.poller.schedule_id
+                else:
+                    self._borrowed.pop(key, None)
         return calendars
+
+    def _confirm_days(
+        self,
+        account: Account,
+        client: AisClient,
+        schedule_id: str,
+        facility_id: int,
+        days: Optional[List[date]],
+    ) -> Optional[List[date]]:
+        """Re-read a borrowed calendar with the subscriber's own schedule_id.
+
+        Called only once a borrowed answer holds a day worth booking. The
+        declared ``visa_type`` is trusted for polling, so this is the one place
+        a wrong declaration is caught: the subscriber's own ``days.json`` is
+        what gets acted on. ``None`` means the confirming request failed.
+        """
+        source = self._borrowed.pop((schedule_id, facility_id), None)
+        if source is None:
+            return days
+        own = client.get_available_days(schedule_id, facility_id)
+        if own is None:
+            self.log(
+                f"    {consulate_name(facility_id):<12} hit via {source}, but "
+                f"confirming with {schedule_id}'s own account failed"
+            )
+        elif (own[:1] or [None])[0] != (days[:1] or [None])[0]:
+            self.log(
+                f"    {consulate_name(facility_id):<12} hit via {source}, own "
+                f"calendar differs (earliest {own[0] if own else 'none'}); "
+                "using the subscriber's own answer"
+            )
+        return own
 
     # -- account pool ----------------------------------------------------
 
@@ -1174,9 +1228,6 @@ class Worker:
             )
             return
 
-        common = sorted(set.intersection(*(set(d) for d in per_member_days.values())))
-        common = [d for d in common if group.target.accepts(d)]
-
         # Every member lands on the same day, so that day must be earlier than
         # each member's existing appointment. A member whose current date is
         # unreadable blocks the move entirely rather than risk moving it later.
@@ -1188,10 +1239,33 @@ class Worker:
                 group_blocked = True
             elif ceiling is not None:
                 group_ceiling = ceiling if group_ceiling is None else min(group_ceiling, ceiling)
-        if group_blocked:
-            common = []
-        elif group_ceiling is not None:
-            common = [d for d in common if d < group_ceiling]
+
+        def joint(per_member: Dict[str, List[date]]) -> List[date]:
+            out = sorted(set.intersection(*(set(d) for d in per_member.values())))
+            out = [d for d in out if group.target.accepts(d)]
+            if group_blocked:
+                return []
+            if group_ceiling is not None:
+                out = [d for d in out if d < group_ceiling]
+            return out
+
+        common = joint(per_member_days)
+        if common and any((m, facility_id) in self._borrowed for m in members):
+            # A joint hit built from borrowed answers: re-read those members'
+            # own calendars and decide on them.
+            for member in members:
+                own = self._confirm_days(
+                    account, client, member, facility_id, per_member_days[member]
+                )
+                if own is None:
+                    self._record_group_metric(
+                        account, label, facility_id, group.min_slots,
+                        common_days=0, earliest_common=None, slots_found=0,
+                        error="confirm request failed",
+                    )
+                    return
+                per_member_days[member] = own
+            common = joint(per_member_days)
 
         per_member_earliest = {
             m: (min(days) if days else None) for m, days in per_member_days.items()
@@ -1374,6 +1448,15 @@ class Worker:
                 # Not in the batch (a consulate added mid-sweep, or a caller
                 # that did not prefetch): fall back to asking directly.
                 days = client.get_available_days(app.schedule_id, facility_id)
+            if days and any(
+                target.accepts(d) and can_book and (ceiling is None or d < ceiling)
+                for d in days
+            ):
+                # A hit. If the answer came from another schedule_id (canary or
+                # same-type sibling), act on this application's own calendar.
+                days = self._confirm_days(
+                    account, client, app.schedule_id, facility_id, days
+                )
             status = ConsulateStatus(facility_id=facility_id)
 
             if days is None:

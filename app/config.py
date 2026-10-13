@@ -710,6 +710,8 @@ def load_config(path: Optional[Path] = None) -> Config:
             net_raw.get("switch_timeout"), 60, "network.switch_timeout")),
         pause_on_ip_ban=max(0, _as_int(
             net_raw.get("pause_on_ip_ban"), 300, "network.pause_on_ip_ban")),
+        vpn_retry_interval=max(1, _as_int(
+            net_raw.get("vpn_retry_interval"), 300, "network.vpn_retry_interval")),
         timeout=max(1, _as_int(net_raw.get("timeout"), 15, "network.timeout")),
     )
     if network.proxy and not re.match(r"^(socks5h?|socks4|https?)://", network.proxy):

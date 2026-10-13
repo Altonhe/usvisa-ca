@@ -82,13 +82,14 @@ max_concurrent_requests: 3
 # asks -- the server returns one ETag for all of them -- so one request, from
 # any account holding that class (a canary first), answers every application
 # of it. Membership comes from `visa_type` where set, and from observed ETags
-# otherwise. A declared visa_type is verified against ETags before it is
-# shared and again every calendar_reverify_sweeps sweeps; an application or
-# canary that disagrees is simply polled on its own account until it agrees
-# again -- a wrong visa_type costs requests, never a missed slot.
+# otherwise. A declared visa_type is trusted as is -- ETags never override it.
+# When an answer borrowed on the strength of visa_type (from a canary or a
+# sibling) shows a bookable day, the application re-reads days.json on its own
+# account and acts only on that, so a wrong visa_type can never cause a wrong
+# booking (though a wrong canary can hide days the application would see).
 calendar_sharing: true
-# Sweeps between forced re-verification (every application and canary asks on
-# its own once). Costs the full request count once per N.
+# Sweeps between forced re-checks of ETag-based sharing, for applications
+# WITHOUT a visa_type. Costs the full request count for those once per N.
 calendar_reverify_sweeps: 10
 
 # --- Booking speed ----------------------------------------------------------
@@ -156,8 +157,11 @@ network:
   proxy: ""                       # socks5h://openvpn-socks:1080
   ip_ban_detection: true
   # If every VPN profile is refused but your own address is not, use it.
-  # Off by default: it puts your real IP in front of the site.
+  # Off by default: it puts your real IP in front of the site. While on it,
+  # the VPN is re-checked every vpn_retry_interval seconds and traffic moves
+  # back as soon as a profile is accepted.
   direct_fallback: false
+  vpn_retry_interval: 300
   # Seconds to wait for a switched profile to connect.
   switch_timeout: 60
   # Seconds the whole pool pauses when no egress works at all.

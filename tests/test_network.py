@@ -149,6 +149,82 @@ def test_without_a_provider_an_ip_ban_pauses():
     assert g.paused()
 
 
+def test_while_paused_direct_is_tried_when_allowed():
+    net = FakeNet(profiles={"a": False, "b": False}, active="a")
+    g = guard(net, direct_fallback=True)
+    assert g.recover() is False and g.paused()   # host IP refused too, at first
+
+    net.direct_ok = True                          # host IP accepted again
+    assert g.check_paused() is True
+    assert g.mode == "direct" and not g.paused()
+
+
+def test_direct_fallback_moves_back_to_the_vpn_once_it_works(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("app.network.time.monotonic", lambda: clock[0])
+    net = FakeNet(profiles={"a": False, "b": False}, active="a", direct_ok=True)
+    g = guard(net, direct_fallback=True, vpn_retry_interval=300)
+    assert g.recover() is True and g.mode == "direct"
+
+    net.profiles["a"] = True
+    assert g.maybe_return_to_vpn() is False, "not before the retry interval"
+    assert g.mode == "direct"
+
+    clock[0] += 301
+    assert g.maybe_return_to_vpn() is True
+    assert g.mode == "vpn" and g.proxies() == {"http": SOCKS, "https": SOCKS}
+
+
+def test_direct_stays_while_the_vpn_is_still_refused(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("app.network.time.monotonic", lambda: clock[0])
+    net = FakeNet(profiles={"a": False, "b": False}, active="a", direct_ok=True)
+    g = guard(net, direct_fallback=True, vpn_retry_interval=300)
+    g.recover()
+    net.switches.clear()
+    clock[0] += 301
+    assert g.maybe_return_to_vpn() is False
+    assert g.mode == "direct"
+    assert len(net.switches) == 1, "steps one profile per check"
+
+
+def test_return_to_vpn_is_a_no_op_on_the_vpn():
+    g = guard(FakeNet(profiles={"a": True}, active="a"))
+    assert g.maybe_return_to_vpn() is False and g.mode == "vpn"
+
+
+def test_pause_lifts_as_soon_as_the_egress_works_again():
+    net = FakeNet(profiles={"a": False, "b": False}, active="a")
+    g = guard(net, pause_on_ip_ban=300)
+    assert g.recover() is False and g.paused()
+
+    net.profiles["b"] = True              # the active profile ("b") recovers
+    assert g.check_paused() is True
+    assert not g.paused(), "no need to sit out the rest of the 300s"
+
+
+def test_while_paused_each_check_steps_one_profile():
+    net = FakeNet(profiles={"a": False, "b": False, "c": False}, active="a")
+    g = guard(net, pause_on_ip_ban=300)
+    g.recover()                           # walked a->b->c->a, all refused
+    net.switches.clear()
+    net.profiles["b"] = True
+
+    assert g.check_paused() is True
+    assert net.switches == ["b"], "one step per check, not a full walk"
+    assert not g.paused()
+
+
+def test_while_paused_a_dead_egress_stays_paused():
+    net = FakeNet(profiles={"a": False, "b": False}, active="a")
+    g = guard(net, pause_on_ip_ban=300)
+    g.recover()
+    net.switches.clear()
+    assert g.check_paused() is False
+    assert g.paused()
+    assert len(net.switches) == 1
+
+
 # ---------------------------------------------------------------------------
 # Worker: who gets blamed
 # ---------------------------------------------------------------------------
@@ -234,6 +310,9 @@ class StubGuard:
     def paused(self):
         return False
 
+    def maybe_return_to_vpn(self, should_stop=None):
+        return False
+
     def apply(self, session):
         pass
 
@@ -317,6 +396,7 @@ def test_paused_pool_skips_the_sweep(tmp_path):
     g = StubGuard("ip")
     g.paused = lambda: True
     g.pause_left = lambda: 42
+    g.check_paused = lambda should_stop=None: False   # egress still dead
     client = Client("1")
     client.get_available_days_meta = lambda *a: pytest.fail("polled while paused")
     w = build(tmp_path, {"A": client}, network=g)
