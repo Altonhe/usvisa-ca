@@ -141,12 +141,18 @@ booking_retry_delay: 2
 #                  when a whole sweep fails the sign-in page is probed through
 #                  the current egress; if the site refuses the address, the
 #                  OpenVPN profile is rotated until one is accepted.
-# Run the provider with:  docker compose --profile vpn up -d
+# Under Docker Compose both values below are filled in for you: the compose
+# file sets OPENVPN_PROVIDER_URL / AIS_PROXY in the environment, which is used
+# whenever a value here is left empty -- so traffic goes through the VPN
+# sidecar. Run with `uv run usvisa` on the host and they stay empty: direct
+# connection, IP bans detected but not rotated.
 network:
   # Control API of the OpenVPN provider. Empty: no rotation, IP bans are only
   # detected (accounts are not wrongly rested) and the pool pauses instead.
+  # Falls back to $OPENVPN_PROVIDER_URL.
   openvpn_provider_url: ""        # http://openvpn-provider:8080
   # Every AIS request goes through this proxy. Empty means direct.
+  # Falls back to $AIS_PROXY.
   proxy: ""                       # socks5h://openvpn-socks:1080
   ip_ban_detection: true
   # If every VPN profile is refused but your own address is not, use it.

@@ -354,6 +354,18 @@ def test_network_defaults(tmp_path):
     assert cfg.network.ip_ban_detection and not cfg.network.direct_fallback
 
 
+def test_network_falls_back_to_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENVPN_PROVIDER_URL", PROVIDER)
+    monkeypatch.setenv("AIS_PROXY", SOCKS)
+    cfg = load_config(write(tmp_path, BASE))
+    assert cfg.network.openvpn_provider_url == PROVIDER
+    assert cfg.network.proxy == SOCKS
+
+    # An explicit value in the file still wins.
+    cfg = load_config(write(tmp_path, BASE + "network: {proxy: socks5h://other:1080}\n"))
+    assert cfg.network.proxy == "socks5h://other:1080"
+
+
 def test_network_parsed(tmp_path):
     cfg = load_config(write(tmp_path, BASE + f"""
 network:

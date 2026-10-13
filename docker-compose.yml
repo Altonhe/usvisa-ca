@@ -11,6 +11,10 @@ services:
     # .env only supplies the Docker knobs substituted below.
     environment:
       TZ: ${TZ:-UTC}
+      # Used by config.yaml's `network:` when its values are left empty. Set
+      # both to empty in .env to talk to the site directly instead.
+      OPENVPN_PROVIDER_URL: ${OPENVPN_PROVIDER_URL-http://openvpn-provider:8080}
+      AIS_PROXY: ${AIS_PROXY-socks5h://openvpn-socks:1080}
 
     # Optional escape hatch for hosts running a DNS-level blocker. AdGuard,
     # Pi-hole and hosts-file blockers resolve newrelic.com to 0.0.0.0 as a
@@ -35,12 +39,12 @@ services:
       # The JSON store, so restarts keep availability history and bookings.
       - watcher-data:/app/data
 
-    # Only matters when the `vpn` profile is enabled; without it the watcher
-    # starts on its own and talks to the site directly.
+    # Wait for the tunnel to be up (the provider's healthcheck only passes once
+    # OpenVPN reports connected), so the first sweep cannot go out unproxied
+    # or fail against a SOCKS port with no tunnel behind it.
     depends_on:
       openvpn-provider:
-        condition: service_started
-        required: false
+        condition: service_healthy
     networks:
       - watcher-net
 
@@ -62,18 +66,13 @@ services:
   # OpenVPN egress (copied from the bcpark project). Runs OpenVPN, exposes a
   # SOCKS5 proxy bound to the tunnel on :1080 and a control API on :8080
   # (/status, /profiles, /switch). Neither port is published to the host.
-  #
-  # Opt-in:   docker compose --profile vpn up -d
-  # Then in config.yaml:
-  #   network:
-  #     openvpn_provider_url: http://openvpn-provider:8080
-  #     proxy: socks5h://openvpn-socks:1080
+  # Started by a plain `docker compose up`, and the watcher waits for it.
   #
   # Credentials: deploy/secrets/openvpn_auth.txt, either two lines
   # (username, password) or JSON -- see openvpn_auth.example.txt. NordVPN
-  # "service credentials", not your account login.
+  # "service credentials", not your account login. The file must exist or
+  # `docker compose up` refuses to start.
   openvpn-provider:
-    profiles: ["vpn"]
     build:
       context: ./docker/openvpn-provider
       dockerfile: Dockerfile

@@ -697,8 +697,13 @@ def load_config(path: Optional[Path] = None) -> Config:
     if not isinstance(net_raw, dict):
         raise ConfigError("network: expected a mapping")
     network = NetworkConfig(
-        openvpn_provider_url=str(net_raw.get("openvpn_provider_url") or "").strip(),
-        proxy=str(net_raw.get("proxy") or "").strip(),
+        # Empty in the file falls back to the environment, which is how the
+        # compose file routes the container through its VPN sidecar.
+        openvpn_provider_url=str(
+            net_raw.get("openvpn_provider_url")
+            or os.getenv("OPENVPN_PROVIDER_URL") or ""
+        ).strip(),
+        proxy=str(net_raw.get("proxy") or os.getenv("AIS_PROXY") or "").strip(),
         ip_ban_detection=_as_bool(net_raw.get("ip_ban_detection"), True),
         direct_fallback=_as_bool(net_raw.get("direct_fallback"), False),
         switch_timeout=max(1, _as_int(
