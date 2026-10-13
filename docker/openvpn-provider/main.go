@@ -34,7 +34,7 @@ func main() {
 		log.Printf("initial OpenVPN start failed: %v", err)
 	}
 
-	go downloadConfigs(cfg.ConfigDir)
+	go downloadConfigs(cfg.ConfigDir, provider.StartIfIdle)
 	go provider.serveSOCKS()
 
 	if err := provider.serveControl(); err != nil {

@@ -145,6 +145,22 @@ func (p *Provider) Switch(req SwitchRequest) error {
 	return p.Start(profile)
 }
 
+// StartIfIdle starts OpenVPN on the configured profile unless it is already
+// connected or connecting. Called after the profile download, which on a
+// fresh volume finishes after the initial Start has already failed.
+func (p *Provider) StartIfIdle() {
+	p.mu.Lock()
+	running := p.cmd != nil && (p.status == "connected" || p.status == "connecting")
+	p.mu.Unlock()
+	if running {
+		return
+	}
+	log.Printf("profiles available; starting OpenVPN")
+	if err := p.Start(p.cfg.ConfigName); err != nil {
+		log.Printf("OpenVPN start after profile update failed: %v", err)
+	}
+}
+
 func (p *Provider) Status() Status {
 	p.mu.Lock()
 	defer p.mu.Unlock()

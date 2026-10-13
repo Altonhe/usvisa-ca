@@ -98,3 +98,27 @@ func TestProviderListsAndSwitchesOnlyAllowlistedProfiles(t *testing.T) {
 		t.Fatal("provider included or started a non-allowlisted profile")
 	}
 }
+
+
+// Regression: on a fresh volume the initial Start fails ("no allowlisted
+// profiles") because the download has not finished yet, and nothing retried,
+// so the provider stayed in "error" and its healthcheck never passed.
+func TestStartIfIdleRetriesOnceProfilesExist(t *testing.T) {
+	dir := t.TempDir()
+	p := &Provider{cfg: Config{ConfigDir: dir, OpenVPNBinary: "openvpn-binary-that-does-not-exist"}}
+
+	if err := p.Start(""); err == nil || !strings.Contains(err.Error(), "no allowlisted") {
+		t.Fatalf("empty dir should fail for lack of profiles, got %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "ca2102.nordvpn.com.udp.ovpn"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	p.StartIfIdle()
+
+	// It now got as far as launching OpenVPN (which fails here only because
+	// the test binary does not exist) -- i.e. it retried with the new profile.
+	if last := p.Status().LastError; !strings.Contains(last, "start OpenVPN") {
+		t.Fatalf("StartIfIdle did not retry with the downloaded profile; lastError = %q", last)
+	}
+}

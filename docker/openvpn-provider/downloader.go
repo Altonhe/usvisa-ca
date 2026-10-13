@@ -68,7 +68,11 @@ func configCategory(name string) string {
 	return fmt.Sprintf("%s-%s", country, proto)
 }
 
-func downloadConfigs(configDir string) {
+// downloadConfigs refreshes the allowlisted profiles now and every 24h.
+// onUpdate runs after each successful refresh, so a provider that could not
+// start for lack of profiles (the first boot, with an empty /vpn) starts as
+// soon as they exist instead of staying in "error" until restarted.
+func downloadConfigs(configDir string, onUpdate func()) {
 	for {
 		func() {
 			log.Printf("Starting background update of NordVPN configurations from official archive...")
@@ -172,6 +176,9 @@ func downloadConfigs(configDir string) {
 			}
 
 			log.Printf("Successfully updated %d NordVPN configurations from official archive (allowlisted servers only).", len(extractedFiles))
+			if len(extractedFiles) > 0 && onUpdate != nil {
+				onUpdate()
+			}
 		}()
 
 		// Sleep for 24 hours
