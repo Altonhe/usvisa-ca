@@ -10,6 +10,8 @@
 !.env.example
 config.yaml
 data/
+deploy/
+docker/
 *.log
 
 # Local Python artefacts

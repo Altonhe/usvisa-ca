@@ -133,6 +133,11 @@ config.yaml
 data/
 store.json
 
+# OpenVPN: downloaded profiles and real credentials stay local
+deploy/openvpn/*.ovpn
+deploy/secrets/*
+!deploy/secrets/openvpn_auth.example.txt
+
 # Spyder project settings
 .spyderproject
 .spyproject

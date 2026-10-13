@@ -1,8 +1,9 @@
 """Polling engine.
 
-Runs in a background thread next to the dashboard.  One sweep visits every
-account, then every application on that account, then every consulate that
-application targets, and books the best acceptable slot it finds.
+Runs in a background thread next to the dashboard.  One sweep prepares every
+account in the pool, asks for each distinct calendar once -- from a canary
+where one fits, spread over the pool otherwise (see :mod:`app.planner`) -- and
+then books each application on its own account from that shared calendar.
 
 Design notes worth knowing:
 
@@ -10,7 +11,8 @@ Design notes worth knowing:
   posts routinely return zero days, and conflating that with a failed request
   made the old implementation unreadable.
 * Each account keeps its own session.  A login failure isolates to that account
-  instead of stopping the whole service.
+  instead of stopping the whole service, and an account that keeps failing is
+  rested for ``account_cooldown`` seconds while the rest of the pool covers it.
 * ``test_mode`` assembles the booking request and logs it, but never sends it.
 """
 
@@ -24,19 +26,26 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .ais_client import (AisClient, AisError, LoginFailed, Schedule,
                          SessionExpired, Slot, TransientNetworkError,
                          parse_site_date)
 from .capsolver import CapSolver, CapSolverError
 from .config import Account, Application, Config, Group, Target
-from .calendars import CalendarCache
 from .consulates import consulate_local_hour, consulate_name
 from .metrics import GroupRecord, collect, collect_groups
 from .newrelic import NewRelicClient
+from .network import NetworkGuard
 from .notifier import TelegramNotifier
+from .planner import CalendarPlanner, Poll, Poller, PollResult, Subscription
 from .store import ConsulateStatus, Store
+
+# (account, client, actionable (Application, Schedule) pairs) for one sweep.
+Prepared = Tuple[Account, AisClient, List[Tuple[Application, Schedule]]]
+# (account, exception, reason): one failure awaiting classification. A None
+# exception is a "soft" failure -- the requests failed, the session did not.
+Incident = Tuple[Account, Optional[Exception], str]
 
 
 class Worker:
@@ -46,11 +55,15 @@ class Worker:
         store: Store,
         notifier: TelegramNotifier,
         newrelic: Optional[NewRelicClient] = None,
+        network: Optional[NetworkGuard] = None,
     ):
         self.config = config
         self.store = store
         self.notifier = notifier
         self.newrelic = newrelic
+        # Owns the egress route. None means direct, with no IP-ban detection:
+        # every failure is then the account's, exactly as before.
+        self.network = network
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._clients: Dict[str, AisClient] = {}
@@ -73,13 +86,22 @@ class Worker:
         # actionable, is it already booked) changes at most once, so paying for
         # it every sweep was the single largest waste in the polling loop.
         self._discovery_cache: Dict[str, Tuple[float, List[Tuple[Application, Schedule]]]] = {}
-        # Learns, from the server's own ETags, which (schedule_id, facility)
-        # pairs are the same calendar, so one request can answer for several
-        # applications instead of asking the identical question per applicant.
-        self._calendars = CalendarCache(
+        # Decides, for the whole account pool at once, which account asks for
+        # which calendar, so one request answers every application of a class
+        # and the requests are spread over canaries and subscribers instead of
+        # landing on whichever account holds the applicant.
+        self._planner = CalendarPlanner(
             enabled=config.calendar_sharing,
             reverify_sweeps=config.calendar_reverify_sweeps,
+            logger=self.log,
         )
+        # account -> monotonic time it rejoins the pool. Set once an account
+        # reaches max_consecutive_failures: retrying a blocked account every
+        # sweep only deepens the block, while the rest of the pool can carry
+        # its calendars in the meantime.
+        self._cooldown_until: Dict[str, float] = {}
+        # account -> availability requests it made in the last sweep.
+        self._last_load: Dict[str, int] = {}
         # Consecutive sweeps that saw "nothing actionable any more". The site
         # intermittently reports a schedule as completed/locked when it is
         # really just a bad response, so we require this to hold for several
@@ -117,6 +139,11 @@ class Worker:
         """
         for account in self.config.accounts:
             self.store.register_account(account.name, account.email)
+            if account.canary:
+                # Probes only: its schedule_ids are not applications to watch.
+                self.store.set_pending_discovery(account.name, False)
+                self.store.prune_applications(account.name, [])
+                continue
             self.store.set_pending_discovery(account.name, account.auto_discover)
             group_consulates = self._group_consulates_by_member(account)
             for app in account.applications:
@@ -138,7 +165,7 @@ class Worker:
         # Forget accounts and applications the configuration no longer mentions.
         self.store.prune_accounts([a.name for a in self.config.accounts])
         for account in self.config.accounts:
-            if not account.auto_discover:
+            if not account.auto_discover and not account.canary:
                 self.store.prune_applications(
                     account.name, [a.schedule_id for a in account.applications]
                 )
@@ -186,6 +213,8 @@ class Worker:
             )
         ]
         sessions = []
+        now = time.monotonic()
+        pool = []
         for account in self.config.accounts:
             path = self._session_path(account.name)
             sessions.append({
@@ -194,16 +223,34 @@ class Worker:
                 "saved": path.exists(),
                 "path": str(path),
             })
-        return {"groups": groups, "sessions": sessions}
+            until = self._cooldown_until.get(account.name, 0.0)
+            pool.append({
+                "account": account.name,
+                "canary": account.canary,
+                "available": self._pool_available(account),
+                "failures": self._failures.get(account.name, 0),
+                "cooldown_left": max(0, int(until - now)),
+                "requests_last_sweep": self._last_load.get(account.name, 0),
+            })
+        return {
+            "groups": groups,
+            "sessions": sessions,
+            "pool": pool,
+            "network": self.network.status() if self.network else {"enabled": False},
+        }
 
     # -- main loop -------------------------------------------------------
 
     def _run(self) -> None:
         self.store.worker_status = "running"
         total_apps = sum(
-            len(a.applications) if a.applications else 1 for a in self.config.accounts
+            len(a.applications) if a.applications else 1
+            for a in self.config.accounts if not a.canary
         )
-        self.notifier.startup(len(self.config.accounts), total_apps, self.config.test_mode)
+        self.notifier.startup(
+            sum(1 for a in self.config.accounts if not a.canary),
+            total_apps, self.config.test_mode,
+        )
 
         while not self._stop.is_set():
             self.store.sweep_count += 1
@@ -274,6 +321,8 @@ class Worker:
         """Every facility the configuration actually watches, in config order."""
         found: List[int] = []
         for account in self.config.accounts:
+            if account.canary:
+                continue
             targets: List[Target] = [account.target]
             targets.extend(a.target for a in account.applications)
             for group in account.groups:
@@ -369,7 +418,9 @@ class Worker:
         snapshot = self.store.snapshot()
         if not snapshot["accounts"]:
             return False
-        if any(acc["error"] for acc in snapshot["accounts"]):
+        canaries = {a.name for a in self.config.accounts if a.canary}
+        if any(acc["error"] for acc in snapshot["accounts"]
+               if acc["name"] not in canaries):
             return False
         applications = [
             app for acc in snapshot["accounts"] for app in acc["applications"]
@@ -388,7 +439,9 @@ class Worker:
         snapshot = self.store.snapshot()
         if not snapshot["accounts"]:
             return False
-        if any(acc["error"] for acc in snapshot["accounts"]):
+        canaries = {a.name for a in self.config.accounts if a.canary}
+        if any(acc["error"] for acc in snapshot["accounts"]
+               if acc["name"] not in canaries):
             return False
         applications = [
             app for acc in snapshot["accounts"] for app in acc["applications"]
@@ -397,51 +450,426 @@ class Worker:
             return False
         return all(app["state"] == "booked" for app in applications)
 
-    # -- per account -----------------------------------------------------
+    # -- the sweep -------------------------------------------------------
 
     def _sweep(self) -> None:
-        for index, account in enumerate(self.config.accounts):
+        """One pass over the whole account pool, in three phases.
+
+        1. **Prepare.** Every account that is not resting signs in (or reuses
+           its session) and, unless it is a canary, resolves which of its
+           applications are actionable.
+        2. **Global calendar.** Everything those applications want becomes one
+           set of subscriptions; the planner collapses identical calendars and
+           hands each request to an account in the pool -- canaries first --
+           and the requests run in parallel across accounts.
+        3. **Book.** Each subscriber account reads its answers out of that
+           shared calendar and books on its own session, exactly as before.
+        """
+        sweep = self.store.sweep_count
+        accounts = self.config.accounts
+        by_name = {a.name: a for a in accounts}
+        clients: Dict[str, AisClient] = {}
+        prepared: List[Prepared] = []
+        failed: Set[str] = set()
+        # Failures are only *collected* during the sweep. Whether they are the
+        # accounts' fault or the egress IP's cannot be known until the sweep
+        # is over -- see _settle_incidents.
+        incidents: List[Incident] = []
+        # Did anything reach the site and get a real answer this sweep? If so
+        # the egress is fine and every failure is account-level.
+        talked = False
+
+        if self.network is not None:
+            if self.network.paused():
+                self.log(
+                    "network: no working egress, pool paused for another "
+                    f"{self.network.pause_left()}s"
+                )
+                return
+            for cached in self._clients.values():
+                session = getattr(cached, "session", None)
+                if session is not None:
+                    self.network.apply(session)
+
+        # -- 1. prepare ------------------------------------------------------
+        for index, account in enumerate(accounts):
             if self._stop.is_set():
                 return
             self.store.register_account(account.name, account.email)
+            if not self._pool_available(account):
+                left = int(self._cooldown_until[account.name] - time.monotonic())
+                self.log(f"[{account.name}] resting, back in the pool in {left}s")
+                continue
+            # Only a fresh sign-in or discovery is heavy enough to be worth
+            # spacing out from the next account's.
+            heavy = account.name not in self._clients or (
+                not account.canary and self._discovery_stale(account)
+            )
             try:
-                self._sweep_account(account)
-                self._failures[account.name] = 0
-            except SessionExpired as exc:
-                # Expected periodically; not a failure worth counting or alerting.
-                self.log(f"[{account.name}] {exc}")
-                self._clients.pop(account.name, None)
-                self._discard_saved_session(account.name)
-                self._invalidate_discovery(account.name)
-            except TransientNetworkError as exc:
-                # The network blipped, not the session. Keep the cookies and try
-                # again next sweep; a full traceback here is pure noise.
-                count = self._failures.get(account.name, 0) + 1
-                self._failures[account.name] = count
-                self.log(
-                    f"[{account.name}] network error, keeping the session: {exc} "
-                    f"(consecutive: {count})"
+                client = self._client_for(account)
+                applications = (
+                    [] if account.canary
+                    else self._resolve_applications(account, client)
                 )
-                self.store.set_account_error(
-                    account.name, f"network error: {exc}"
-                )
-                if count == self.config.max_consecutive_failures:
-                    self.notifier.account_error(
-                        account.name,
-                        f"{count} consecutive network errors reaching the site. "
-                        f"Still retrying every {self.config.poll_interval}s.",
-                    )
-            except (LoginFailed, CapSolverError) as exc:
-                self._handle_account_failure(account, f"login failed: {exc}")
-            except AisError as exc:
-                self._handle_account_failure(account, str(exc))
             except Exception as exc:  # noqa: BLE001 - isolate to this account
-                self._handle_account_failure(account, f"unexpected error: {exc}")
-                traceback.print_exc()
+                self._incident(incidents, failed, account, exc)
+            else:
+                clients[account.name] = client
+                talked = talked or heavy
+                if not account.canary:
+                    if applications:
+                        prepared.append((account, client, applications))
+                    else:
+                        self.log(f"[{account.name}] nothing actionable on this account")
 
-            if index < len(self.config.accounts) - 1:
+            if heavy and index < len(accounts) - 1 and self.config.account_poll_delay:
                 if self._stop.wait(self.config.account_poll_delay):
                     return
+
+        # -- 2. global calendar ---------------------------------------------
+        subscriptions = self._subscriptions(prepared)
+        canaries = [
+            Poller(account.name, app.schedule_id, app.visa_type, canary=True)
+            for account in accounts
+            if account.canary and account.name in clients
+            for app in account.applications
+        ]
+        plan = self._planner.plan(subscriptions, canaries, sweep)
+        self._last_load = plan.load()
+        if plan.polls:
+            self.log(plan.summary())
+        results, stats, errors = self._execute_polls(plan.polls, clients)
+        self._planner.observe(plan, results)
+        calendars = self._fan_out(results)
+
+        talked = talked or any(ok for ok, _ in stats.values())
+        for name, exc in errors.items():
+            if name not in failed:
+                self._incident(incidents, failed, by_name[name], exc)
+        for name, (ok, bad) in stats.items():
+            if name in failed or ok or not bad:
+                continue
+            # Every request this account made failed: the signature of an
+            # account (or an address) the site has started refusing. Counted,
+            # so it ends up resting, but the session is kept --
+            # re-authenticating a refused account is the worst thing to do.
+            incidents.append(
+                (by_name[name], None, f"all {bad} availability request(s) failed")
+            )
+            failed.add(name)
+
+        # -- 3. book ---------------------------------------------------------
+        for account, client, applications in prepared:
+            if self._stop.is_set():
+                return
+            if account.name in failed:
+                continue
+            try:
+                self._process_account(account, client, applications, calendars)
+            except Exception as exc:  # noqa: BLE001 - isolate to this account
+                self._incident(incidents, failed, account, exc)
+
+        for name in clients:
+            if name not in failed:
+                self._record_success(by_name[name])
+
+        self._settle_incidents(incidents, talked)
+
+    def _subscriptions(self, prepared: List[Prepared]) -> List[Subscription]:
+        """Every (application, consulate) calendar the booking phase will read."""
+        subs: List[Subscription] = []
+        for account, _client, applications in prepared:
+            by_id = {app.schedule_id: app for app, _ in applications}
+            for app, _schedule in applications:
+                if self._booked.get(app.schedule_id):
+                    continue
+                for facility_id in app.target.consulates:
+                    subs.append(Subscription(
+                        account.name, app.schedule_id, facility_id, app.visa_type,
+                    ))
+            for group in account.groups:
+                members = [
+                    m for m in group.members
+                    if m in by_id and not self._booked.get(m)
+                ]
+                if len(members) < 2:
+                    continue
+                for member in members:
+                    for facility_id in group.consulates:
+                        subs.append(Subscription(
+                            account.name, member, facility_id,
+                            by_id[member].visa_type,
+                        ))
+        return subs
+
+    def _execute_polls(
+        self, polls: List[Poll], clients: Dict[str, AisClient],
+    ) -> Tuple[List[PollResult], Dict[str, Tuple[int, int]], Dict[str, Exception]]:
+        """Run every planned request, in parallel across accounts.
+
+        Each account gets at most ``max_concurrent_requests`` in flight on its
+        own session (the host is HTTP/1.1, so each is a TCP connection), and
+        different accounts run side by side. With the limit at 1 an account's
+        requests are strictly sequential and spaced by
+        ``consulate_poll_delay``, as they always were.
+
+        A failed request falls back to the poll's next candidate -- another
+        account able to read the same calendar -- once, so one refused account
+        does not leave a whole class blind for the sweep.
+
+        Returns ``(results, stats, errors)``: ``stats`` is account ->
+        ``(succeeded, failed)`` request counts, ``errors`` the first exception
+        each account raised.
+        """
+        if not polls:
+            return [], {}, {}
+
+        limit = max(1, self.config.max_concurrent_requests)
+        delay = self.config.consulate_poll_delay if limit == 1 else 0
+        gates = {name: threading.BoundedSemaphore(limit) for name in clients}
+        lock = threading.Lock()
+        started: Set[str] = set()
+        counts: Dict[str, List[int]] = {}
+        errors: Dict[str, Exception] = {}
+
+        def ask(poller: Poller, facility_id: int):
+            client = clients.get(poller.account)
+            with lock:
+                if client is None or poller.account in errors:
+                    return None, None
+            with gates[poller.account]:
+                if self._stop.is_set():
+                    return None, None
+                if delay:
+                    with lock:
+                        first = poller.account not in started
+                        started.add(poller.account)
+                    if not first and self._stop.wait(delay):
+                        return None, None
+                try:
+                    days, etag = client.get_available_days_meta(
+                        poller.schedule_id, facility_id
+                    )
+                except Exception as exc:  # noqa: BLE001 - reported per account
+                    with lock:
+                        errors.setdefault(poller.account, exc)
+                    days, etag = None, None
+            with lock:
+                tally = counts.setdefault(poller.account, [0, 0])
+                tally[0 if days is not None else 1] += 1
+            return days, etag
+
+        def run(poll: Poll) -> PollResult:
+            last: Optional[Poller] = None
+            attempts = 0
+            for poller in poll.candidates:
+                if poller.account not in clients:
+                    continue
+                if attempts == 2:
+                    break
+                attempts += 1
+                last = poller
+                days, etag = ask(poller, poll.facility_id)
+                if days is not None:
+                    if attempts > 1:
+                        self.log(
+                            f"[{poller.account}] answered "
+                            f"{consulate_name(poll.facility_id)} after "
+                            f"{poll.candidates[0].account} failed"
+                        )
+                    return PollResult(poll, poller, days, etag)
+            return PollResult(poll, last, None, None)
+
+        workers = min(len(polls), limit * max(1, len(clients)))
+        if workers <= 1:
+            results = []
+            for poll in polls:
+                if self._stop.is_set():
+                    break
+                results.append(run(poll))
+        else:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="days"
+            ) as pool:
+                results = [f.result() for f in [pool.submit(run, p) for p in polls]]
+
+        stats = {name: (c[0], c[1]) for name, c in counts.items()}
+        return results, stats, errors
+
+    @staticmethod
+    def _fan_out(
+        results: List[PollResult],
+    ) -> Dict[Tuple[str, int], Optional[List[date]]]:
+        """``(schedule_id, facility_id) -> days`` for every subscriber covered."""
+        calendars: Dict[Tuple[str, int], Optional[List[date]]] = {}
+        for res in results:
+            for schedule_id in res.poll.covers:
+                calendars[(schedule_id, res.poll.facility_id)] = res.days
+        return calendars
+
+    # -- account pool ----------------------------------------------------
+
+    def _pool_available(self, account: Account) -> bool:
+        """False while the account is resting after repeated failures."""
+        until = self._cooldown_until.get(account.name)
+        return until is None or time.monotonic() >= until
+
+    def _maybe_cool_down(self, account: Account, reason: str) -> None:
+        """Rest an account that has failed max_consecutive_failures in a row.
+
+        Not a permanent removal: once the rest is over the account gets one
+        more try, and only a further failure rests it again.
+        """
+        count = self._failures.get(account.name, 0)
+        rest = self.config.account_cooldown
+        if rest <= 0 or count < max(1, self.config.max_consecutive_failures):
+            return
+        self._cooldown_until[account.name] = time.monotonic() + rest
+        back = (datetime.now() + timedelta(seconds=rest)).strftime("%H:%M:%S")
+        self.log(
+            f"[{account.name}] {count} consecutive failures: resting it for "
+            f"{rest}s (until {back}); the rest of the pool covers its calendars"
+        )
+        self.store.set_account_error(
+            account.name, f"{reason} -- resting until {back}"
+        )
+
+    def _record_success(self, account: Account) -> None:
+        if self._failures.get(account.name) or account.name in self._cooldown_until:
+            if account.name in self._cooldown_until:
+                self.log(f"[{account.name}] back in the pool")
+            self.store.set_account_error(account.name, "")
+        self._failures[account.name] = 0
+        self._cooldown_until.pop(account.name, None)
+
+    def _soft_failure(self, account: Account, reason: str) -> None:
+        """Count a failure that does not invalidate the session."""
+        count = self._failures.get(account.name, 0) + 1
+        self._failures[account.name] = count
+        self.log(
+            f"[{account.name}] {reason}, keeping the session "
+            f"(consecutive: {count})"
+        )
+        self.store.set_account_error(account.name, reason)
+        if count == self.config.max_consecutive_failures:
+            self.notifier.account_error(
+                account.name,
+                f"{reason}\n{count} consecutive failures; resting the account "
+                f"for {self.config.account_cooldown}s, then retrying",
+            )
+        self._maybe_cool_down(account, reason)
+
+    def _incident(
+        self, incidents: List[Incident], failed: Set[str],
+        account: Account, exc: Exception,
+    ) -> None:
+        """Note a failure; an expired session is handled on the spot.
+
+        A lapsed session is routine and says nothing about bans, so it is
+        dealt with immediately. Everything else waits for the end of the sweep
+        to be classified.
+        """
+        failed.add(account.name)
+        if isinstance(exc, SessionExpired):
+            self._handle_sweep_exception(account, exc)
+            return
+        incidents.append((account, exc, str(exc)))
+
+    def _settle_incidents(self, incidents: List[Incident], talked: bool) -> None:
+        """Charge this sweep's failures to the accounts -- or to the egress.
+
+        If any account got a real answer from the site, the egress works and
+        every failure is the failing account's own: counted, and eventually
+        rested. Only when *nothing* got through is the egress itself suspect;
+        the network guard then probes it. An IP ban is not charged to any
+        account (they did nothing wrong, and resting them all fixes nothing):
+        the egress is rotated instead. Planned site maintenance is charged to
+        no one at all.
+        """
+        if not incidents:
+            return
+        cause = "account"
+        if not talked and self.network is not None:
+            cause = self.network.classify_failed_sweep()
+
+        if cause == "account":
+            for account, exc, reason in incidents:
+                if exc is None:
+                    self._soft_failure(account, reason)
+                else:
+                    self._handle_sweep_exception(account, exc)
+            return
+
+        names = ", ".join(sorted({a.name for a, _, _ in incidents}))
+        probe = self.network.last_probe if self.network else None
+        detail = probe.detail if probe else ""
+        if cause == "maintenance":
+            self.log(
+                f"network: the site is down for maintenance ({detail}); not "
+                f"counting this sweep's failures against {names}"
+            )
+            for account, _, _ in incidents:
+                self.store.set_account_error(account.name, "site maintenance")
+            return
+
+        # cause == "ip"
+        self.log(
+            f"network: the egress IP is refused by the site ({detail}). "
+            f"{names} failed because of the address, not the accounts; "
+            "rotating the egress instead of resting them"
+        )
+        for account, _, _ in incidents:
+            self.store.set_account_error(account.name, "egress IP blocked")
+        recovered = self.network.recover(should_stop=self._stop.is_set)
+        if recovered:
+            for client in self._clients.values():
+                session = getattr(client, "session", None)
+                if session is not None:
+                    self.network.apply(session)
+            for account, _, _ in incidents:
+                self.store.set_account_error(account.name, "")
+            outcome = f"Recovered: now routing via {self.network.mode}."
+        else:
+            outcome = (
+                "No working egress found; the pool is paused for "
+                f"{self.network.config.pause_on_ip_ban}s."
+            )
+        self.log(f"network: {outcome}")
+        self.notifier.account_error(
+            "all accounts", f"Egress IP blocked ({detail}). {outcome}"
+        )
+
+    def _handle_sweep_exception(self, account: Account, exc: Exception) -> None:
+        if isinstance(exc, SessionExpired):
+            # Expected periodically; not a failure worth counting or alerting.
+            self.log(f"[{account.name}] {exc}")
+            self._clients.pop(account.name, None)
+            self._discard_saved_session(account.name)
+            self._invalidate_discovery(account.name)
+        elif isinstance(exc, TransientNetworkError):
+            # The network blipped, not the session. Keep the cookies and try
+            # again next sweep; a full traceback here is pure noise.
+            count = self._failures.get(account.name, 0) + 1
+            self._failures[account.name] = count
+            self.log(
+                f"[{account.name}] network error, keeping the session: {exc} "
+                f"(consecutive: {count})"
+            )
+            self.store.set_account_error(account.name, f"network error: {exc}")
+            if count == self.config.max_consecutive_failures:
+                self.notifier.account_error(
+                    account.name,
+                    f"{count} consecutive network errors reaching the site. "
+                    f"Still retrying every {self.config.poll_interval}s.",
+                )
+            self._maybe_cool_down(account, f"network error: {exc}")
+        elif isinstance(exc, (LoginFailed, CapSolverError)):
+            self._handle_account_failure(account, f"login failed: {exc}")
+        elif isinstance(exc, AisError):
+            self._handle_account_failure(account, str(exc))
+        else:
+            self._handle_account_failure(account, f"unexpected error: {exc}")
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
 
     def _handle_account_failure(self, account: Account, reason: str) -> None:
         count = self._failures.get(account.name, 0) + 1
@@ -457,9 +885,10 @@ class Worker:
         if count == self.config.max_consecutive_failures:
             self.notifier.account_error(
                 account.name,
-                f"{reason}\n{count} consecutive failures; still retrying every "
-                f"{self.config.poll_interval}s",
+                f"{reason}\n{count} consecutive failures; resting the account "
+                f"for {self.config.account_cooldown}s, then retrying",
             )
+        self._maybe_cool_down(account, reason)
 
     def _session_path(self, account_name: str) -> Path:
         """Where this account's cookies + landing_url are persisted.
@@ -513,6 +942,8 @@ class Worker:
         )
         session_path = self._session_path(account.name)
         resumed = False
+        if self.network is not None:
+            self.network.apply(client.session)
         if client.load_cookies(session_path):
             resumed = client.resume_session()
             if not resumed:
@@ -529,33 +960,31 @@ class Worker:
         self._clients[account.name] = client
         return client
 
-    def _sweep_account(self, account: Account) -> None:
-        client = self._client_for(account)
-        applications = self._resolve_applications(account, client)
-        if not applications:
-            self.log(f"[{account.name}] nothing actionable on this account")
-            return
+    def _discovery_stale(self, account: Account) -> bool:
+        cached = self._discovery_cache.get(account.name)
+        return cached is None or (
+            time.monotonic() - cached[0] >= self.config.discovery_interval
+        )
 
+    def _process_account(
+        self,
+        account: Account,
+        client: AisClient,
+        applications: List[Tuple[Application, Schedule]],
+        calendars: Dict[Tuple[str, int], Optional[List[date]]],
+    ) -> None:
+        """Book for one account from the sweep's shared calendar."""
         by_id = {app.schedule_id: (app, sched) for app, sched in applications}
         for group in account.groups:
             if self._stop.is_set():
                 return
-            self._sweep_group(account, client, group, by_id)
+            self._sweep_group(account, client, group, by_id, calendars)
 
         checked: List[str] = []
         pending = [
             (app, sched) for app, sched in applications
             if not self._booked.get(app.schedule_id)
         ]
-        # One batched, deduplicated, concurrent fetch for the whole account
-        # rather than a delayed request per application per consulate.
-        pairs = [
-            (app.schedule_id, facility_id)
-            for app, _ in pending
-            for facility_id in app.target.consulates
-        ]
-        calendars = self._fetch_calendars(account, client, pairs)
-
         for app, schedule in pending:
             if self._stop.is_set():
                 return
@@ -616,6 +1045,7 @@ class Worker:
                     schedule_id=sched.id,
                     label=sched.action_label or "",
                     target=account.target,
+                    visa_type=account.visa_type,
                 )
                 pairs.append((app, sched))
         else:
@@ -678,6 +1108,7 @@ class Worker:
         client: AisClient,
         group: Group,
         by_id: Dict[str, Tuple[Application, Schedule]],
+        calendars: Optional[Dict[Tuple[str, int], Optional[List[date]]]] = None,
     ) -> None:
         """Find a day that works for every member of ``group`` at once.
 
@@ -697,7 +1128,10 @@ class Worker:
         for facility_id in group.consulates:
             if self._stop.is_set():
                 return
-            self._sweep_group_facility(account, client, group, members, by_id, facility_id, label)
+            self._sweep_group_facility(
+                account, client, group, members, by_id, facility_id, label,
+                calendars,
+            )
 
     def _sweep_group_facility(
         self,
@@ -708,16 +1142,14 @@ class Worker:
         by_id: Dict[str, Tuple[Application, Schedule]],
         facility_id: int,
         label: str,
+        calendars: Optional[Dict[Tuple[str, int], Optional[List[date]]]] = None,
     ) -> None:
-        # Route the group's members through the same batched, ETag-deduplicated
-        # fetch the per-application sweep uses. Members of a joint constraint
-        # are usually siblings of one visa class, so the server reports their
-        # calendars as one resource and this collapses to a single request --
-        # and it drops the per-member consulate_poll_delay that made a group
-        # check the slowest part of a sweep.
-        calendars = self._fetch_calendars(
-            account, client, [(member, facility_id) for member in members]
-        )
+        # Normally the sweep's shared calendar already holds every member's
+        # answer. Called on its own (or for a member it missed), ask through
+        # the same planner so siblings of one class still cost one request.
+        wanted = [(member, facility_id) for member in members]
+        if calendars is None or any(pair not in calendars for pair in wanted):
+            calendars = self._fetch_calendars(account, client, wanted)
 
         per_member_days: Dict[str, List[date]] = {}
         any_error = False
@@ -873,65 +1305,34 @@ class Worker:
         client: AisClient,
         pairs: List[Tuple[str, int]],
     ) -> Dict[Tuple[str, int], Optional[List[date]]]:
-        """Fetch every calendar the sweep needs, in as few requests as possible.
+        """Fetch calendars for one account only, through the global planner.
 
-        Two savings compound here. Requests the server reports as the same
-        resource are made once and shared (see :mod:`app.calendars`), and what
-        remains is issued concurrently instead of paying
-        ``consulate_poll_delay`` between each one -- that delay alone was
-        turning a handful of 200ms calls into a 16-second sweep.
-
-        Concurrency is bounded by ``max_concurrent_requests`` because the host
-        is HTTP/1.1: every slot is a separate TCP connection, so this is a knob
-        for footprint, not just speed. With it set to 1 the old sequential,
-        delayed behaviour is restored exactly.
+        The sweep plans across the whole pool; this is the same machinery
+        scoped to a single account, for callers that need calendars outside a
+        sweep. Identical calendars are still asked once (ETag or declared
+        ``visa_type``), and the requests still run concurrently.
 
         Returns ``(schedule_id, facility_id) -> days``, where ``None`` means the
         request failed and ``[]`` means it succeeded and nothing is available.
+        Re-raises the first exception a request raised, as callers expect.
         """
         if not pairs:
             return {}
-
-        plans = self._calendars.plan(pairs, self.store.sweep_count)
-        if len(plans) < len(pairs):
-            self.log(
-                f"[{account.name}] {CalendarCache.summarise(plans, len(pairs))}"
-            )
-
-        results: Dict[Tuple[str, int], Optional[List[date]]] = {}
-
-        def fetch(plan):
-            return plan, client.get_available_days_meta(
-                plan.schedule_id, plan.facility_id
-            )
-
-        def record(plan, days, etag) -> None:
-            # Only the polled pair teaches us its ETag; the ones riding along
-            # keep whatever class they were already in.
-            self._calendars.observe(plan.schedule_id, plan.facility_id, etag)
-            for schedule_id in plan.covers:
-                results[(schedule_id, plan.facility_id)] = days
-
-        workers = min(self.config.max_concurrent_requests, len(plans))
-        if workers > 1:
-            with ThreadPoolExecutor(
-                max_workers=workers, thread_name_prefix="days"
-            ) as pool:
-                futures = [pool.submit(fetch, plan) for plan in plans]
-                for future in as_completed(futures):
-                    plan, (days, etag) = future.result()
-                    record(plan, days, etag)
-        else:
-            for index, plan in enumerate(plans):
-                if self._stop.is_set():
-                    break
-                if index and self.config.consulate_poll_delay:
-                    if self._stop.wait(self.config.consulate_poll_delay):
-                        break
-                plan, (days, etag) = fetch(plan)
-                record(plan, days, etag)
-
-        return results
+        types = {a.schedule_id: a.visa_type for a in account.applications}
+        subs = [
+            Subscription(account.name, sid, fid, types.get(sid))
+            for sid, fid in pairs
+        ]
+        plan = self._planner.plan(subs, (), self.store.sweep_count)
+        if len(plan.polls) < plan.subscriptions:
+            self.log(f"[{account.name}] {plan.summary()}")
+        results, _stats, errors = self._execute_polls(
+            plan.polls, {account.name: client}
+        )
+        self._planner.observe(plan, results)
+        if errors:
+            raise next(iter(errors.values()))
+        return self._fan_out(results)
 
     def _sweep_application(
         self,

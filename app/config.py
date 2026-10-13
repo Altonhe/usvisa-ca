@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 from .consulates import consulate_name, parse_consulate_list
+from .network import NetworkConfig
 
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
@@ -210,6 +211,12 @@ class Application:
     schedule_id: str = ""
     label: str = ""
     target: Target = field(default_factory=Target)
+    # Visa class, as a free-form label ("B1/B2", "F1"...). Only ever compared
+    # for equality: two applications with the same label at one consulate are
+    # assumed to share a calendar, which lets one request (possibly from a
+    # canary account) answer for all of them. The assumption is verified from
+    # the server's ETags and corrected on its own when it is wrong.
+    visa_type: Optional[str] = None
 
     @property
     def display_name(self) -> str:
@@ -253,11 +260,18 @@ class Account:
     target: Target = field(default_factory=Target)
     applications: List[Application] = field(default_factory=list)
     groups: List[Group] = field(default_factory=list)
+    # Inherited by auto-discovered applications.
+    visa_type: Optional[str] = None
+    # A canary only reads calendars for others: it is never discovered,
+    # never booked, and its schedule_ids are not shown as applications. Any
+    # account whose days.json still answers -- even one whose appointment is
+    # long over -- can serve as one.
+    canary: bool = False
 
     @property
     def auto_discover(self) -> bool:
         """True when no explicit application list was configured."""
-        return not self.applications
+        return not self.applications and not self.canary
 
 
 @dataclass
@@ -307,6 +321,7 @@ class Config:
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     newrelic: NewRelicConfig = field(default_factory=NewRelicConfig)
+    network: NetworkConfig = field(default_factory=NetworkConfig)
     capsolver_api_key: str = ""
     test_mode: bool = True
     poll_interval: int = 300
@@ -314,6 +329,12 @@ class Config:
     consulate_poll_delay: int = 2
     account_poll_delay: int = 10
     max_consecutive_failures: int = 5
+    # Seconds an account is taken out of the pool once it reaches
+    # max_consecutive_failures. Retrying a blocked account on every sweep only
+    # deepens the block; resting it lets the other accounts in the pool carry
+    # its calendars meanwhile. After the rest it gets one more try, and another
+    # rest if that fails too.
+    account_cooldown: int = 300
     # Discovery (the landing page plus one continue_actions page per
     # application) is all HTML, dwarfs days.json, and carries no availability.
     # What it reports changes at most once, so it is cached this many seconds
@@ -378,7 +399,7 @@ class Config:
         return self.data_dir / "store.json"
 
     def total_applications(self) -> int:
-        return sum(len(a.applications) for a in self.accounts)
+        return sum(len(a.applications) for a in self.accounts if not a.canary)
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +498,20 @@ def _parse_group(
     )
 
 
-def _parse_account(raw: Dict[str, Any], defaults: Target, index: int) -> Account:
+def _as_visa_type(value: Any, inherited: Optional[str]) -> Optional[str]:
+    """Normalise a visa class label; only ever compared for equality."""
+    if value is None:
+        return inherited
+    text = re.sub(r"\s+", "", str(value)).upper()
+    return text or None
+
+
+def _parse_account(
+    raw: Dict[str, Any],
+    defaults: Target,
+    index: int,
+    default_visa_type: Optional[str] = None,
+) -> Account:
     label = f"accounts[{index}]"
     if not isinstance(raw, dict):
         raise ConfigError(f"{label}: expected a mapping, got {type(raw).__name__}")
@@ -494,6 +528,8 @@ def _parse_account(raw: Dict[str, Any], defaults: Target, index: int) -> Account
         )
 
     account_target = _parse_target(raw, defaults, label)
+    account_visa = _as_visa_type(raw.get("visa_type"), default_visa_type)
+    canary = _as_bool(raw.get("canary"), False)
 
     applications: List[Application] = []
     for j, app_raw in enumerate(raw.get("applications") or []):
@@ -513,8 +549,30 @@ def _parse_account(raw: Dict[str, Any], defaults: Target, index: int) -> Account
                 schedule_id=schedule_id,
                 label=str(app_raw.get("label") or "").strip(),
                 target=_parse_target(app_raw, account_target, app_label),
+                visa_type=_as_visa_type(app_raw.get("visa_type"), account_visa),
             )
         )
+
+    if canary:
+        # A canary is matched to requirements by visa_type alone: it holds
+        # nothing to discover, so without both it could never be used.
+        if not applications:
+            raise ConfigError(
+                f"{label} ({name!r}) is a canary, so it needs an explicit "
+                "applications list with the schedule_id(s) to probe with"
+            )
+        for j, app in enumerate(applications):
+            if not app.visa_type:
+                raise ConfigError(
+                    f"{label}.applications[{j}] ({name!r}) is a canary without "
+                    "a visa_type; set it on the application or the account so "
+                    "it can be matched to the applications it probes for"
+                )
+        if raw.get("groups"):
+            raise ConfigError(
+                f"{label} ({name!r}) is a canary and is never booked, so it "
+                "cannot have groups"
+            )
 
     known_ids = [a.schedule_id for a in applications]
     groups: List[Group] = []
@@ -546,6 +604,8 @@ def _parse_account(raw: Dict[str, Any], defaults: Target, index: int) -> Account
         target=account_target,
         applications=applications,
         groups=groups,
+        visa_type=account_visa,
+        canary=canary,
     )
 
 
@@ -573,11 +633,20 @@ def load_config(path: Optional[Path] = None) -> Config:
     # unconfigured run does not fan out across every post.
     seed = Target(consulates=parse_consulate_list("Toronto", default_all=False))
     defaults = _parse_target(defaults_raw, seed, "defaults")
+    default_visa_type = _as_visa_type(defaults_raw.get("visa_type"), None)
 
     accounts_raw = raw.get("accounts") or []
     if not isinstance(accounts_raw, list) or not accounts_raw:
         raise ConfigError("accounts: at least one account is required")
-    accounts = [_parse_account(a, defaults, i) for i, a in enumerate(accounts_raw)]
+    accounts = [
+        _parse_account(a, defaults, i, default_visa_type)
+        for i, a in enumerate(accounts_raw)
+    ]
+    if all(a.canary for a in accounts):
+        raise ConfigError(
+            "accounts: every account is a canary, so there is nothing to book; "
+            "add at least one account without `canary: true`"
+        )
 
     seen_emails = set()
     for acc in accounts:
@@ -624,11 +693,39 @@ def load_config(path: Optional[Path] = None) -> Config:
             "<data_dir>/store.json. Set `data_dir` instead."
         )
 
+    net_raw = raw.get("network") or {}
+    if not isinstance(net_raw, dict):
+        raise ConfigError("network: expected a mapping")
+    network = NetworkConfig(
+        openvpn_provider_url=str(net_raw.get("openvpn_provider_url") or "").strip(),
+        proxy=str(net_raw.get("proxy") or "").strip(),
+        ip_ban_detection=_as_bool(net_raw.get("ip_ban_detection"), True),
+        direct_fallback=_as_bool(net_raw.get("direct_fallback"), False),
+        switch_timeout=max(1, _as_int(
+            net_raw.get("switch_timeout"), 60, "network.switch_timeout")),
+        pause_on_ip_ban=max(0, _as_int(
+            net_raw.get("pause_on_ip_ban"), 300, "network.pause_on_ip_ban")),
+        timeout=max(1, _as_int(net_raw.get("timeout"), 15, "network.timeout")),
+    )
+    if network.proxy and not re.match(r"^(socks5h?|socks4|https?)://", network.proxy):
+        raise ConfigError(
+            f"network.proxy: {network.proxy!r} must start with socks5h://, "
+            "socks5://, socks4://, http:// or https://"
+        )
+    if network.provider_enabled and not network.proxy:
+        raise ConfigError(
+            "network.openvpn_provider_url is set but network.proxy is empty, so "
+            "switching profiles would not change the route AIS traffic takes; "
+            "set proxy to the provider's SOCKS address (e.g. "
+            "socks5h://openvpn-socks:1080)"
+        )
+
     return Config(
         accounts=accounts,
         telegram=telegram,
         dashboard=dashboard,
         newrelic=newrelic,
+        network=network,
         capsolver_api_key=str(raw.get("capsolver_api_key") or "").strip(),
         test_mode=_as_bool(raw.get("test_mode"), True),
         poll_interval=_as_int(raw.get("poll_interval"), 300, "poll_interval"),
@@ -638,6 +735,9 @@ def load_config(path: Optional[Path] = None) -> Config:
         max_consecutive_failures=_as_int(
             raw.get("max_consecutive_failures"), 5, "max_consecutive_failures"
         ),
+        account_cooldown=max(0, _as_int(
+            raw.get("account_cooldown"), 300, "account_cooldown"
+        )),
         done_confirmations=_as_int(
             raw.get("done_confirmations"), 5, "done_confirmations"
         ),

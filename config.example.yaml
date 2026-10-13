@@ -25,10 +25,10 @@ poll_interval: 300
 # below. They are listed explicitly because account_poll_delay in particular
 # dominates how long a sweep takes, and you cannot tune what you cannot see.
 
-# Seconds to wait between accounts inside one sweep. Paid once per extra
-# account, every sweep: with two accounts that is a flat 10s added to every
-# sweep regardless of how fast the requests themselves are. Lower it if your
-# sweep wall time matters more than spreading load across accounts.
+# Seconds to wait before moving on to the next account when this one had to
+# sign in or re-run discovery (the heavy HTML pages). Steady-state sweeps,
+# which reuse the session and the cached discovery, do not pay it: the
+# availability requests of different accounts run side by side.
 account_poll_delay: 10
 
 # Seconds between individual availability requests when they are NOT being run
@@ -41,9 +41,15 @@ consulate_poll_delay: 2
 # trips on a genuine stall.
 http_timeout: 30
 
-# Consecutive failures on one account before a Telegram alert fires. The bot
-# keeps retrying either way; this only controls when it tells you.
+# Consecutive failures on one account before a Telegram alert fires and the
+# account is rested (see account_cooldown). Other accounts keep polling.
 max_consecutive_failures: 5
+
+# Seconds an account sits out of the pool after max_consecutive_failures.
+# Retrying a blocked account every sweep only deepens the block; meanwhile
+# canaries and other accounts carry its calendars. When the rest is over it
+# gets one more try, and another rest if that fails too. 0 disables resting.
+account_cooldown: 300
 
 # The site intermittently reports a schedule as completed/locked (or an
 # account as holding nothing actionable) when the response is really just a
@@ -65,22 +71,24 @@ done_confirmations: 5
 # changed: a booking landed, or the session lapsed.
 discovery_interval: 900
 
-# days.json calls that may be in flight at once. This replaces paying
-# consulate_poll_delay serially between every consulate, which on a few
-# applications turned a handful of 200ms calls into a 20+ second sweep.
-# Each slot is a separate TCP connection, so treat this as a footprint knob.
-# Set to 1 to restore the old strictly-sequential, delayed behaviour.
+# days.json calls that may be in flight at once, PER ACCOUNT. Different
+# accounts always run side by side. Each slot is a separate TCP connection, so
+# treat this as a footprint knob. Set to 1 for strictly sequential requests on
+# each account, spaced by consulate_poll_delay.
 max_concurrent_requests: 3
 
-# Collapse availability requests the server itself reports as the same
-# resource. days.json for a given (visa class, consulate) is byte-identical
-# across sibling applications -- the server returns one ETag for all of them --
-# so one request can answer for every member of that class. The grouping is
-# never guessed from this file: it is observed from those ETags at runtime.
+# Ask for each calendar once for the whole account pool. days.json for a
+# given (visa class, consulate) is the same resource whichever schedule_id
+# asks -- the server returns one ETag for all of them -- so one request, from
+# any account holding that class (a canary first), answers every application
+# of it. Membership comes from `visa_type` where set, and from observed ETags
+# otherwise. A declared visa_type is verified against ETags before it is
+# shared and again every calendar_reverify_sweeps sweeps; an application or
+# canary that disagrees is simply polled on its own account until it agrees
+# again -- a wrong visa_type costs requests, never a missed slot.
 calendar_sharing: true
-# Sweeps between forced re-observation. Every Nth sweep polls each application
-# separately and re-derives the grouping, so a class that stops being identical
-# splits itself back apart on its own. Costs the full request count once per N.
+# Sweeps between forced re-verification (every application and canary asks on
+# its own once). Costs the full request count once per N.
 calendar_reverify_sweeps: 10
 
 # --- Booking speed ----------------------------------------------------------
@@ -124,6 +132,30 @@ active_hours: []
 # until the next full sweep.
 booking_retry_attempts: 3
 booking_retry_delay: 2
+
+# --- Network egress ---------------------------------------------------------
+# Two kinds of block need opposite fixes:
+#   account ban -> one account is refused while others get through. That
+#                  account rests (account_cooldown); the pool covers for it.
+#   IP ban      -> every account fails at once. Resting them fixes nothing, so
+#                  when a whole sweep fails the sign-in page is probed through
+#                  the current egress; if the site refuses the address, the
+#                  OpenVPN profile is rotated until one is accepted.
+# Run the provider with:  docker compose --profile vpn up -d
+network:
+  # Control API of the OpenVPN provider. Empty: no rotation, IP bans are only
+  # detected (accounts are not wrongly rested) and the pool pauses instead.
+  openvpn_provider_url: ""        # http://openvpn-provider:8080
+  # Every AIS request goes through this proxy. Empty means direct.
+  proxy: ""                       # socks5h://openvpn-socks:1080
+  ip_ban_detection: true
+  # If every VPN profile is refused but your own address is not, use it.
+  # Off by default: it puts your real IP in front of the site.
+  direct_fallback: false
+  # Seconds to wait for a switched profile to connect.
+  switch_timeout: 60
+  # Seconds the whole pool pauses when no egress works at all.
+  pause_on_ip_ban: 300
 
 # Where the app keeps its JSON store (store.json is created inside).
 data_dir: data
@@ -190,6 +222,11 @@ dashboard:
 # ---------------------------------------------------------------------------
 defaults:
   consulates: [TRT]
+  # Visa class label, compared for equality only ("B1/B2", "F1", ...).
+  # Optional, but it is what lets one request -- possibly from a canary --
+  # serve every application of a class. Set per account or per application
+  # to override.
+  # visa_type: B1/B2
   earliest_acceptable_date: 2026-09-01
   latest_acceptable_date: 2026-12-30
   # true  -> poll every listed consulate, take the globally earliest match
@@ -246,3 +283,18 @@ accounts:
   #   password: ""
   #   consulates: [VAN]
   #   latest_acceptable_date: 2027-03-31
+
+  # A canary only reads calendars; it is never booked. Any account whose
+  # days.json still answers works -- including one whose visa was issued long
+  # ago. It needs the schedule_id to ask with and a visa_type, which is how it
+  # is matched to the applications it probes for (verified from ETags; a
+  # mismatch just means it is not used for that class). Polling prefers
+  # canaries, so add more of them to spread the load and keep your real
+  # accounts quiet.
+  # - name: Canary-B2
+  #   email: old@example.com
+  #   password: ""
+  #   canary: true
+  #   visa_type: B1/B2
+  #   applications:
+  #     - schedule_id: "60001234"

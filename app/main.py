@@ -18,6 +18,7 @@ import uvicorn
 from .config import Config, ConfigError, load_config
 from .dashboard import create_app
 from .metrics import collect
+from .network import NetworkGuard
 from .newrelic import NewRelicClient
 from .notifier import TelegramNotifier
 from .store import Store
@@ -217,7 +218,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     notifier.verify()
     if newrelic:
         newrelic.verify()
-    worker = Worker(config, store, notifier, newrelic=newrelic)
+    network = NetworkGuard(
+        config.network, locale=config.locale, user_agent=config.user_agent,
+        logger=_print,
+    )
+    if config.network.proxy:
+        _print(f"network: AIS traffic goes through {config.network.proxy}")
+    if config.network.provider_enabled:
+        _print(f"network: OpenVPN provider at {config.network.openvpn_provider_url}")
+    worker = Worker(config, store, notifier, newrelic=newrelic, network=network)
 
     if args.once:
         _print("\nrunning a single sweep\n")

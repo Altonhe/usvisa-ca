@@ -105,6 +105,35 @@
   .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; }
   .dot.on { background: var(--ok); }
   .dot.off { background: var(--muted); }
+
+  /* Account pool + network */
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    margin-bottom: 18px; overflow: hidden;
+  }
+  .panel-head {
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline;
+  }
+  .panel-body { padding: 12px 16px; }
+  .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px 18px; margin: 0; }
+  .kv dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .kv dd { margin: 2px 0 0; font-size: 13px; word-break: break-all; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 14px; }
+  select, button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 10px; font: inherit; font-size: 12px;
+  }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--info); }
+  button:disabled { opacity: .5; cursor: default; }
+  .pill.connected, .pill.available, .pill.ok { background: rgba(63,185,80,.16); color: var(--ok); }
+  .pill.connecting, .pill.resting, .pill.maintenance { background: rgba(210,153,34,.16); color: var(--warn); }
+  .pill.offline, .pill.blocked, .pill.ip { background: rgba(248,81,73,.16); color: var(--bad); }
+  .pill.canary { background: rgba(88,166,255,.16); color: var(--info); }
+  #net-result { margin-top: 10px; font-size: 12px; color: var(--muted); min-height: 1em; }
+  .history { margin-top: 12px; max-height: 180px; overflow: auto; font-size: 12px; }
+  .history div { color: var(--muted); padding: 2px 0; border-bottom: 1px dashed var(--line); }
 </style>
 </head>
 <body>
@@ -150,6 +179,13 @@
 
   {% if not worker_running and data.worker_status not in ['finished'] %}
   <div class="banner bad">The polling thread is not running.</div>
+  {% endif %}
+
+  {% if network.enabled and network.paused %}
+  <div class="banner bad">
+    <strong>Egress IP blocked and no working route was found.</strong>
+    The whole pool is paused for another {{ network.pause_left }}s.
+  </div>
   {% endif %}
 
   <div class="cards">
@@ -331,6 +367,125 @@
     {% endif %}
   </section>
   {% endfor %}
+
+  {% if pool %}
+  <h1 style="font-size:14px;margin:24px 0 10px">Account pool</h1>
+  <section class="panel">
+    <table>
+      <thead>
+        <tr><th>Account</th><th>Role</th><th>State</th><th>Consecutive failures</th><th>Requests last sweep</th></tr>
+      </thead>
+      <tbody>
+      {% for p in pool %}
+        <tr>
+          <td>{{ p.account }}</td>
+          <td>{% if p.canary %}<span class="pill canary">canary</span>{% else %}subscriber{% endif %}</td>
+          <td>
+            {% if p.available %}<span class="pill available">available</span>
+            {% else %}<span class="pill resting">resting {{ p.cooldown_left }}s</span>{% endif %}
+          </td>
+          <td>{{ p.failures }}</td>
+          <td>{{ p.requests_last_sweep }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="group-note">
+      An account that fails on its own (others still get through) is an account
+      ban: it rests and the rest of the pool covers its calendars. When every
+      account fails at once the egress IP is probed instead, and an IP ban
+      rotates the OpenVPN profile rather than resting anyone.
+    </div>
+  </section>
+  {% endif %}
+
+  {% if network.enabled %}
+  <h1 style="font-size:14px;margin:24px 0 10px">Network egress</h1>
+  <section class="panel" id="network">
+    <div class="panel-head">
+      <strong>{{ 'OpenVPN' if network.provider_enabled else 'Direct' }}</strong>
+      {% if network.provider_enabled %}
+        <span class="pill {{ network.provider.status | default('offline') }}">{{ network.provider.status | default('offline') }}</span>
+      {% endif %}
+      <span class="sub">routing via <code>{{ network.mode }}</code>{% if network.proxy %} &middot; <code>{{ network.proxy }}</code>{% endif %}</span>
+      {% if network.last_verdict %}
+        <span class="pill {{ network.last_verdict }}">last failed sweep: {{ network.last_verdict }} ban{% if network.last_verdict == 'maintenance' %}/maintenance{% endif %}</span>
+      {% endif %}
+    </div>
+    <div class="panel-body">
+      <dl class="kv">
+        {% if network.provider_enabled %}
+        <div><dt>Active profile</dt><dd>{{ network.provider.activeProfile | default('-') }}</dd></div>
+        <div><dt>Profiles</dt><dd>{{ network.profiles | length }}</dd></div>
+        <div><dt>Switches</dt><dd>{{ network.provider.switchCount | default(0) }}</dd></div>
+        {% endif %}
+        <div><dt>IP bans seen</dt><dd>{{ network.ip_bans }}</dd></div>
+        <div><dt>IP-ban detection</dt><dd>{{ 'on' if network.ip_ban_detection else 'off' }}</dd></div>
+        <div><dt>Direct fallback</dt><dd>{{ 'on' if network.direct_fallback else 'off' }}</dd></div>
+        {% if network.last_probe %}
+        <div><dt>Last probe</dt><dd>{{ network.last_probe.verdict }} &middot; {{ network.last_probe.detail }}<br><span class="kind">{{ network.last_probe.at }}</span></dd></div>
+        {% endif %}
+        {% if network.provider.lastError %}
+        <div><dt>Provider error</dt><dd>{{ network.provider.lastError }}</dd></div>
+        {% elif network.provider.error %}
+        <div><dt>Provider error</dt><dd>{{ network.provider.error }}</dd></div>
+        {% endif %}
+      </dl>
+
+      <div class="controls">
+        {% if network.provider_enabled %}
+        <select id="net-profile" {% if not network.profiles %}disabled{% endif %}>
+          {% for profile in network.profiles %}
+            <option value="{{ profile }}" {% if profile == network.provider.activeProfile %}selected{% endif %}>{{ profile }}</option>
+          {% endfor %}
+        </select>
+        <button type="button" onclick="netSwitch(false)" {% if not network.profiles %}disabled{% endif %}>Switch profile</button>
+        <button type="button" onclick="netSwitch(true)" {% if not network.profiles %}disabled{% endif %}>Random profile</button>
+        {% endif %}
+        <button type="button" onclick="netCall('POST', '/api/network/probe')">Probe AIS</button>
+        <button type="button" onclick="netCall('GET', '/api/network/egress')">Check egress IP</button>
+      </div>
+      {% if network.provider_enabled and not network.profiles %}
+      <div class="msg" style="margin-top:8px">
+        No profiles yet. The provider downloads its allowlisted NordVPN profiles into
+        <code>deploy/openvpn/</code> (mounted as <code>/vpn</code>) on start.
+      </div>
+      {% endif %}
+      <div id="net-result"></div>
+
+      {% if network.history %}
+      <div class="history">
+        {% for h in network.history %}
+        <div><code>{{ h.at }}</code> {{ h.event }}{% if h.profile %} &middot; {{ h.profile }}{% endif %}{% if h.verdict %} &middot; {{ h.verdict }}{% endif %}{% if h.detail %} &middot; {{ h.detail }}{% endif %}</div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </section>
+  <script>
+    async function netCall(method, url, body) {
+      const out = document.getElementById('net-result');
+      out.textContent = '...';
+      try {
+        const res = await fetch(url, {
+          method,
+          headers: { 'X-Requested-With': 'usvisa-dashboard', 'Content-Type': 'application/json' },
+          body: body ? JSON.stringify(body) : undefined,
+          credentials: 'same-origin',
+        });
+        const text = await res.text();
+        out.textContent = `HTTP ${res.status}: ${text}`;
+      } catch (err) {
+        out.textContent = String(err);
+      }
+    }
+    function netSwitch(random) {
+      const select = document.getElementById('net-profile');
+      netCall('POST', '/api/network/switch',
+              random ? { random: true } : { profile: select ? select.value : '' });
+    }
+  </script>
+  {% endif %}
 
   {% if sessions %}
   <h1 style="font-size:14px;margin:24px 0 10px">Sessions</h1>

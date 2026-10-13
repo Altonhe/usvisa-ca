@@ -35,6 +35,15 @@ services:
       # The JSON store, so restarts keep availability history and bookings.
       - watcher-data:/app/data
 
+    # Only matters when the `vpn` profile is enabled; without it the watcher
+    # starts on its own and talks to the site directly.
+    depends_on:
+      openvpn-provider:
+        condition: service_started
+        required: false
+    networks:
+      - watcher-net
+
     # The process only makes outbound HTTPS calls and serves one port.
     security_opt:
       - no-new-privileges:true
@@ -49,6 +58,69 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  # OpenVPN egress (copied from the bcpark project). Runs OpenVPN, exposes a
+  # SOCKS5 proxy bound to the tunnel on :1080 and a control API on :8080
+  # (/status, /profiles, /switch). Neither port is published to the host.
+  #
+  # Opt-in:   docker compose --profile vpn up -d
+  # Then in config.yaml:
+  #   network:
+  #     openvpn_provider_url: http://openvpn-provider:8080
+  #     proxy: socks5h://openvpn-socks:1080
+  #
+  # Credentials: deploy/secrets/openvpn_auth.txt, either two lines
+  # (username, password) or JSON -- see openvpn_auth.example.txt. NordVPN
+  # "service credentials", not your account login.
+  openvpn-provider:
+    profiles: ["vpn"]
+    build:
+      context: ./docker/openvpn-provider
+      dockerfile: Dockerfile
+    container_name: usvisa-openvpn-provider
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      OPENVPN_CONFIG_DIR: /vpn
+      OPENVPN_CONFIG_NAME: ${OPENVPN_CONFIG_NAME:-}
+      OPENVPN_AUTH_FILE: /run/secrets/openvpn_auth
+      OPENVPN_TUN_INTERFACE: tun0
+      SOCKS_ADDR: ":1080"
+      CONTROL_ADDR: ":8080"
+    volumes:
+      - ./deploy/openvpn:/vpn
+    secrets:
+      - openvpn_auth
+    expose:
+      - "1080"
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health >/dev/null"]
+      interval: 20s
+      timeout: 5s
+      start_period: 30s
+      retries: 6
+    restart: unless-stopped
+    networks:
+      watcher-net:
+        aliases:
+          - openvpn-socks
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+secrets:
+  openvpn_auth:
+    file: ./deploy/secrets/openvpn_auth.txt
+
+networks:
+  watcher-net:
+    driver: bridge
 
 volumes:
   watcher-data:

@@ -23,6 +23,7 @@ from fastapi.templating import Jinja2Templates
 
 from .config import Config
 from .metrics import render_metrics
+from .network import ProviderError
 from .store import Store
 from .worker import Worker
 
@@ -65,7 +66,9 @@ def create_app(config: Config, store: Store, worker: Optional[Worker] = None) ->
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request, _: None = Depends(require_auth)):
-        worker_context = worker.dashboard_context() if worker else {"groups": [], "sessions": []}
+        worker_context = worker.dashboard_context() if worker else {
+            "groups": [], "sessions": [], "pool": [], "network": {"enabled": False},
+        }
         return templates.TemplateResponse(
             request,
             "dashboard.html",
@@ -78,8 +81,65 @@ def create_app(config: Config, store: Store, worker: Optional[Worker] = None) ->
                 "worker_running": bool(worker and worker.running),
                 "groups": worker_context["groups"],
                 "sessions": worker_context["sessions"],
+                "pool": worker_context.get("pool", []),
+                "network": worker_context.get("network", {"enabled": False}),
             },
         )
+
+    # -- network / OpenVPN egress ------------------------------------------
+
+    def network_guard():
+        guard = worker.network if worker else None
+        if guard is None:
+            raise HTTPException(status_code=404, detail="network guard not running")
+        return guard
+
+    def require_xhr(request: Request) -> None:
+        # Basic auth is replayed by the browser on any request, including a
+        # form another site submits. A custom header cannot be set
+        # cross-origin without a CORS preflight this app never grants, so
+        # requiring it keeps state-changing calls same-origin.
+        if request.headers.get("x-requested-with") != "usvisa-dashboard":
+            raise HTTPException(status_code=403, detail="missing X-Requested-With")
+
+    @app.get("/api/network")
+    def api_network(_: None = Depends(require_auth)):
+        return JSONResponse(network_guard().status())
+
+    @app.get("/api/network/egress")
+    def api_network_egress(_: None = Depends(require_auth)):
+        return JSONResponse(network_guard().egress_ip())
+
+    @app.post("/api/network/probe")
+    def api_network_probe(
+        request: Request, _: None = Depends(require_auth),
+    ):
+        require_xhr(request)
+        result = network_guard().probe()
+        return JSONResponse({"verdict": result.verdict, "detail": result.detail, "at": result.at})
+
+    @app.post("/api/network/switch")
+    async def api_network_switch(
+        request: Request, _: None = Depends(require_auth),
+    ):
+        require_xhr(request)
+        guard = network_guard()
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        profile = str(body.get("profile") or "").strip()
+        random = bool(body.get("random"))
+        if not profile and not random:
+            raise HTTPException(status_code=400, detail="profile or random is required")
+        if profile and profile not in guard.profiles():
+            raise HTTPException(status_code=400, detail=f"unknown profile: {profile}")
+        try:
+            return JSONResponse(guard.switch(profile=profile, random=random), status_code=202)
+        except ProviderError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from None
 
     @app.get("/api/state")
     def api_state(_: None = Depends(require_auth)):
