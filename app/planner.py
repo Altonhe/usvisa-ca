@@ -43,6 +43,7 @@ every ``reverify_sweeps`` sweeps.
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -133,6 +134,7 @@ class CalendarPlanner:
         enabled: bool = True,
         reverify_sweeps: int = 10,
         logger: Optional[Callable[[str], None]] = None,
+        rng: Optional[random.Random] = None,
     ) -> None:
         self.enabled = enabled
         self.reverify_sweeps = reverify_sweeps
@@ -140,6 +142,8 @@ class CalendarPlanner:
         # (schedule_id, facility_id) -> last ETag seen for that calendar.
         # Only the untyped path decides anything from it.
         self._etags: Dict[Tuple[str, int], str] = {}
+        # Picks among equally loaded pollers; injectable for tests.
+        self._rng = rng or random.Random()
 
     # -- queries ---------------------------------------------------------
 
@@ -217,8 +221,8 @@ class CalendarPlanner:
         """
         same_type = [c for c in canaries if c.visa_type == visa_type]
         candidates = (
-            _least_loaded(same_type, load)
-            + _least_loaded([s.poller for s in group], load)
+            self._least_loaded(same_type, load)
+            + self._least_loaded([s.poller for s in group], load)
         )
         out.polls.append(Poll(
             facility_id=fid, candidates=candidates,
@@ -226,7 +230,7 @@ class CalendarPlanner:
             kind="shared" if len(candidates) > 1 else "solo",
             label=visa_type,
         ))
-        _bump(load, candidates[0].account)
+        self._bump(load, candidates[0].account)
 
     def _plan_by_etag(
         self,
@@ -241,7 +245,7 @@ class CalendarPlanner:
         if reverify:
             for sub in subs:
                 out.polls.append(self._solo(sub))
-                _bump(load, sub.account)
+                self._bump(load, sub.account)
             return
 
         grouped: Dict[str, List[Subscription]] = {}
@@ -261,19 +265,19 @@ class CalendarPlanner:
                 if self._etags.get((c.schedule_id, fid)) == etag
             ]
             candidates = (
-                _least_loaded(matching, load)
-                + _least_loaded([s.poller for s in members], load)
+                self._least_loaded(matching, load)
+                + self._least_loaded([s.poller for s in members], load)
             )
             out.polls.append(Poll(
                 facility_id=fid, candidates=candidates,
                 covers=tuple(s.schedule_id for s in members),
                 kind="shared" if len(candidates) > 1 else "solo",
             ))
-            _bump(load, candidates[0].account)
+            self._bump(load, candidates[0].account)
 
         for sub in unknown:
             out.polls.append(self._solo(sub))
-            _bump(load, sub.account)
+            self._bump(load, sub.account)
 
     @staticmethod
     def _solo(sub: Subscription, kind: str = "solo", label: str = "") -> Poll:
@@ -298,6 +302,26 @@ class CalendarPlanner:
             for sid in res.poll.covers:
                 self._etags[(sid, fid)] = res.etag
 
+    # -- load balancing --------------------------------------------------
+
+    def _bump(self, load: Dict[str, int], account: str) -> None:
+        load[account] = load.get(account, 0) + 1
+
+    def _least_loaded(
+        self, pollers: Sequence[Poller], load: Dict[str, int],
+    ) -> List[Poller]:
+        """Least loaded this sweep first, random among equals.
+
+        Equivalent to drawing pollers without replacement at random each
+        sweep: one sweep's requests land on different accounts, and over many
+        sweeps every canary of a type gets an even share in expectation, so
+        adding a canary takes load off the others. No history is kept.
+        """
+        shuffled = list(pollers)
+        self._rng.shuffle(shuffled)
+        # sort() is stable, so ties keep their random order.
+        shuffled.sort(key=lambda p: load.get(p.account, 0))
+        return shuffled
 
 
 # -- helpers ---------------------------------------------------------------
@@ -312,13 +336,3 @@ def _dedupe(subs: Sequence[Subscription]) -> List[Subscription]:
             out.append(sub)
     return out
 
-
-def _bump(load: Dict[str, int], account: str) -> None:
-    load[account] = load.get(account, 0) + 1
-
-
-def _least_loaded(pollers: Sequence[Poller], load: Dict[str, int]) -> List[Poller]:
-    """Stable order, least-loaded account first."""
-    indexed = list(enumerate(pollers))
-    indexed.sort(key=lambda item: (load.get(item[1].account, 0), item[0]))
-    return [p for _, p in indexed]

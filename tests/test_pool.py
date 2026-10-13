@@ -54,7 +54,8 @@ def test_declared_class_is_shared_from_the_first_sweep():
     poll = plan.polls[0]
     assert poll.poller.canary, "a same-type canary is preferred"
     assert set(poll.covers) == {"1", "2"}
-    assert [c.account for c in poll.candidates] == ["C", "A", "B"], \
+    assert [c.account for c in poll.candidates][0] == "C"
+    assert {c.account for c in poll.candidates[1:]} == {"A", "B"}, \
         "subscribers stay behind the canary as fallbacks"
 
 
@@ -75,6 +76,40 @@ def test_requests_spread_over_canaries():
     wanted = subs(("A", "1", TRT, "B2"), ("A", "1", VAN, "B2"))
     plan = planner.plan(wanted, canaries, 1)
     assert sorted(p.poller.account for p in plan.polls) == ["C1", "C2"]
+
+
+def test_work_rotates_over_every_canary_across_sweeps():
+    """3 calendars, 4 canaries: no canary may sit idle, none may carry more."""
+    import random
+    from collections import Counter
+    planner = CalendarPlanner(reverify_sweeps=1000, rng=random.Random(7))
+    canaries = [Poller(f"C{i}", f"90{i}", "B2", True) for i in range(4)]
+    wanted = subs(("A", "1", TRT, "B2"), ("A", "1", 91, "B2"),
+                  ("B", "2", VAN, "B2"))
+
+    used = Counter()
+    for n in range(1, 401):
+        plan = planner.plan(wanted, canaries, n)
+        accounts = [p.poller.account for p in plan.polls]
+        assert len(set(accounts)) == 3, "one sweep still spreads over 3 canaries"
+        used.update(accounts)
+    assert set(used) == {"C0", "C1", "C2", "C3"}
+    # 1200 draws over 4 canaries: 300 each in expectation.
+    assert all(240 <= n <= 360 for n in used.values()), used
+
+
+def test_adding_a_canary_takes_load_off_the_others():
+    import random
+    from collections import Counter
+    wanted = subs(("A", "1", TRT, "B2"))
+    for count in (1, 2, 4):
+        planner = CalendarPlanner(reverify_sweeps=1000, rng=random.Random(3))
+        canaries = [Poller(f"C{i}", f"90{i}", "B2", True) for i in range(count)]
+        used = Counter(planner.plan(wanted, canaries, n).polls[0].poller.account
+                       for n in range(1, 801))
+        share = 800 / count
+        assert len(used) == count
+        assert all(0.8 * share <= n <= 1.2 * share for n in used.values()), used
 
 
 def test_untyped_applications_still_share_on_etag_evidence():
