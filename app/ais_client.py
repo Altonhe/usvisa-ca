@@ -325,6 +325,15 @@ class AisClient:
             self._log(f"HTTP 304 from {url} but nothing cached; ignoring")
             return None, None, False
 
+        if resp.status_code == 401:
+            # Devise answers an XHR with no valid session with 401. That is
+            # the site talking to us -- the egress works -- and it is fixed by
+            # signing in again, not by resting the account or the address.
+            self._log(f"HTTP 401 from {url}: session no longer valid")
+            raise SessionExpired(
+                "the AIS session was rejected (HTTP 401); re-authenticating on the next sweep"
+            )
+
         if resp.status_code != 200:
             self._log(f"HTTP {resp.status_code} from {url}")
             return None, None, False

@@ -65,6 +65,11 @@ class FakeNet:
         accepted = self.profiles.get(self.active, False) if proxies else self.direct_ok
         return Resp(200, SIGN_IN) if accepted else Resp(403, "Forbidden")
 
+    def head(self, url, headers=None, proxies=None, timeout=None, allow_redirects=True):
+        self.heads = getattr(self, "heads", 0) + 1
+        resp = self.get(url, headers, proxies, timeout, allow_redirects)
+        return Resp(resp.status_code, "")   # HEAD carries no body
+
     def request(self, method, url, json=None, timeout=None, proxies=None):
         path = url.rsplit("8080", 1)[-1]
         if path == "/status":
@@ -98,6 +103,39 @@ def guard(net, **cfg):
 ])
 def test_probe_verdicts(site, verdict):
     assert guard(FakeNet(site=site)).probe().verdict == verdict
+
+
+def test_probe_uses_head_and_downloads_no_page():
+    # The sign-in page is ~44 KB; a 200 to HEAD is enough to call it OK.
+    net = FakeNet(profiles={"a": True}, active="a")
+    assert guard(net).probe().verdict == OK
+    assert net.heads == 1 and len(net.probes) == 1   # HEAD only, no GET
+
+
+def test_probe_reads_the_body_only_for_a_503():
+    net = FakeNet(site=Resp(503, "down for planned maintenance"))
+    assert guard(net).probe().verdict == MAINTENANCE
+    assert net.heads == 1 and len(net.probes) == 2   # HEAD, then one GET
+
+
+def test_days_401_is_a_lapsed_session_not_a_failure():
+    from app.ais_client import AisClient, SessionExpired
+
+    class S:
+        def get(self, url, headers=None, timeout=None):
+            r = Resp(401, '{"error":"You need to sign in"}')
+            r.headers = {}
+            return r
+
+    client = AisClient.__new__(AisClient)
+    client.session = S()
+    client.timeout = 5
+    client._etag_cache = {}
+    import threading
+    client._etag_lock = threading.Lock()
+    client._log = lambda m: None
+    with pytest.raises(SessionExpired):
+        client._get_json_meta("https://example/days/94.json")
 
 
 def test_probe_goes_through_the_proxy():

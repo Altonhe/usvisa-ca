@@ -224,22 +224,29 @@ class NetworkGuard:
     # -- probing -----------------------------------------------------------
 
     def probe(self, proxies: Optional[Dict[str, str]] = None) -> ProbeResult:
-        """One unauthenticated GET of the sign-in page through an egress."""
+        """One unauthenticated HEAD of the sign-in page through an egress.
+
+        HEAD runs through the same nginx/WAF and Rails route as a GET, so a
+        refused egress still answers 403/429 or fails to connect, but no body
+        is transferred. Only a 503 needs the body (planned maintenance vs. an
+        overloaded/refusing edge), so that rare case alone is re-read with a
+        GET.
+        """
         url = BASE_URL + SIGN_IN_PATH.format(locale=self.locale)
         headers = {"User-Agent": self.user_agent} if self.user_agent else {}
         route = self.proxies() if proxies is None else proxies
+        kwargs = dict(headers=headers, proxies=route, timeout=self.config.timeout)
         try:
-            resp = self._http.get(
-                url, headers=headers, proxies=route,
-                timeout=self.config.timeout, allow_redirects=True,
-            )
+            resp = self._http.head(url, allow_redirects=True, **kwargs)
+            if resp.status_code == 503:
+                resp = self._http.get(url, allow_redirects=True, **kwargs)
         except http.RequestException as exc:
             result = ProbeResult(BLOCKED, f"{type(exc).__name__}: {exc}")
         else:
-            body = resp.text[:20000].lower() if resp.text else ""
+            body = (resp.text or "").lower()
             if resp.status_code == 503 and "maintenance" in body:
                 result = ProbeResult(MAINTENANCE, "site reports planned maintenance")
-            elif resp.status_code == 200 and ("sign_in" in body or "user[email]" in body):
+            elif resp.status_code == 200:
                 result = ProbeResult(OK, "sign-in page served")
             else:
                 result = ProbeResult(BLOCKED, f"HTTP {resp.status_code}")

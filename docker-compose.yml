@@ -11,10 +11,13 @@ services:
     # .env only supplies the Docker knobs substituted below.
     environment:
       TZ: ${TZ:-UTC}
-      # Used by config.yaml's `network:` when its values are left empty. Set
-      # both to empty in .env to talk to the site directly instead.
-      OPENVPN_PROVIDER_URL: ${OPENVPN_PROVIDER_URL-http://openvpn-provider:8080}
-      AIS_PROXY: ${AIS_PROXY-socks5h://openvpn-socks:1080}
+      # Used by config.yaml's `network:` when its values are left empty. Both
+      # default to empty (talk to the site directly / via network.proxy). To
+      # use the bundled OpenVPN provider, start it with `--profile vpn` and set
+      #   OPENVPN_PROVIDER_URL=http://openvpn-provider:8080
+      #   AIS_PROXY=socks5h://openvpn-socks:1080
+      OPENVPN_PROVIDER_URL: ${OPENVPN_PROVIDER_URL-}
+      AIS_PROXY: ${AIS_PROXY-}
       # Machine identity for config.yaml's `secrets:` block (account e-mails
       # and passwords are fetched from Infisical at startup).
       INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID-}
@@ -43,12 +46,12 @@ services:
       # The JSON store, so restarts keep availability history and bookings.
       - watcher-data:/app/data
 
-    # Wait for the tunnel to be up (the provider's healthcheck only passes once
-    # OpenVPN reports connected), so the first sweep cannot go out unproxied
-    # or fail against a SOCKS port with no tunnel behind it.
+    # Only when the `vpn` profile is enabled does the watcher wait for the
+    # tunnel; `required: false` lets a plain `docker compose up` start without it.
     depends_on:
       openvpn-provider:
         condition: service_healthy
+        required: false
     networks:
       - watcher-net
 
@@ -70,13 +73,14 @@ services:
   # OpenVPN egress (copied from the bcpark project). Runs OpenVPN, exposes a
   # SOCKS5 proxy bound to the tunnel on :1080 and a control API on :8080
   # (/status, /profiles, /switch). Neither port is published to the host.
-  # Started by a plain `docker compose up`, and the watcher waits for it.
+  # Opt-in: only started with `docker compose --profile vpn up`.
   #
   # Credentials: deploy/secrets/openvpn_auth.txt, either two lines
   # (username, password) or JSON -- see openvpn_auth.example.txt. NordVPN
   # "service credentials", not your account login. The file must exist or
   # `docker compose up` refuses to start.
   openvpn-provider:
+    profiles: ["vpn"]
     build:
       context: ./docker/openvpn-provider
       dockerfile: Dockerfile
