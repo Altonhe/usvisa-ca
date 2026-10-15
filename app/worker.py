@@ -48,6 +48,12 @@ Prepared = Tuple[Account, AisClient, List[Tuple[Application, Schedule]]]
 Incident = Tuple[Account, Optional[Exception], str]
 
 
+def _site_replies(client: object) -> int:
+    """How many application-level answers a client's session has seen."""
+    count = getattr(getattr(client, "session", None), "site_replies", 0)
+    return count if isinstance(count, int) else 0
+
+
 class Worker:
     def __init__(
         self,
@@ -105,6 +111,9 @@ class Worker:
         # (subscriber schedule_id, facility_id) -> schedule_id whose answer it
         # was given this sweep. A hit on one is re-read by the subscriber.
         self._borrowed: Dict[Tuple[str, int], str] = {}
+        # Dashboard rows: which canaries each target is matched to, as of the
+        # last sweep. Rebuilt every sweep, never persisted.
+        self._last_matching: List[Dict[str, object]] = []
         # Consecutive sweeps that saw "nothing actionable any more". The site
         # intermittently reports a schedule as completed/locked when it is
         # really just a bad response, so we require this to hold for several
@@ -239,6 +248,7 @@ class Worker:
             "groups": groups,
             "sessions": sessions,
             "pool": pool,
+            "matching": list(self._last_matching),
             "network": self.network.status() if self.network else {"enabled": False},
         }
 
@@ -481,6 +491,10 @@ class Worker:
         # Did anything reach the site and get a real answer this sweep? If so
         # the egress is fine and every failure is account-level.
         talked = False
+        # Responses each session had already counted before this sweep; any
+        # increase means the site itself answered something (see
+        # httpclient.site_replied), which clears the egress without a probe.
+        replies_before = {name: _site_replies(c) for name, c in self._clients.items()}
 
         if self.network is not None:
             self.network.maybe_return_to_vpn(self._stop.is_set)
@@ -547,6 +561,9 @@ class Worker:
         results, stats, errors = self._execute_polls(plan.polls, clients)
         self._planner.observe(plan, results)
         calendars = self._fan_out(results)
+        self._last_matching = self._matching_rows(
+            prepared, subscriptions, canaries, results
+        )
 
         talked = talked or any(ok for ok, _ in stats.values())
         for name, exc in errors.items():
@@ -579,7 +596,61 @@ class Worker:
             if name not in failed:
                 self._record_success(by_name[name])
 
+        if not talked:
+            talked = any(
+                _site_replies(c) > replies_before.get(name, 0)
+                for name, c in {**self._clients, **clients}.items()
+            )
         self._settle_incidents(incidents, talked)
+
+    def _matching_rows(
+        self,
+        prepared: List[Prepared],
+        subscriptions: List[Subscription],
+        canaries: List[Poller],
+        results: List[PollResult],
+    ) -> List[Dict[str, object]]:
+        """One dashboard row per (target application, consulate)."""
+        names: Dict[str, str] = {}
+        for _account, _client, applications in prepared:
+            for app, _schedule in applications:
+                names[app.schedule_id] = app.display_name
+        answered: Dict[Tuple[str, int], Optional[Poller]] = {}
+        for res in results:
+            for sid in res.poll.covers:
+                answered[(sid, res.poll.facility_id)] = res.poller
+        rows: List[Dict[str, object]] = []
+        seen: Set[Tuple[str, int]] = set()
+        for sub in subscriptions:
+            key = (sub.schedule_id, sub.facility_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            matched = self._planner.matches(sub.schedule_id, sub.facility_id, canaries)
+            if matched:
+                state = "matched"
+            elif self._planner.is_calibrated(*key):
+                state = "no match"
+            else:
+                state = "checking"
+            poller = answered.get(key)
+            rows.append({
+                "account": sub.account,
+                "schedule_id": sub.schedule_id,
+                "name": names.get(sub.schedule_id, sub.schedule_id),
+                "consulate": consulate_name(sub.facility_id),
+                "visa_type": sub.visa_type,
+                "canaries": sorted({c.account for c in matched}),
+                "state": state,
+                "answered_by": (
+                    None if poller is None
+                    else poller.account if poller.canary
+                    else "self" if poller.schedule_id == sub.schedule_id
+                    else f"{poller.account} ({poller.schedule_id})"
+                ),
+            })
+        rows.sort(key=lambda r: (r["account"], r["name"], r["consulate"]))
+        return rows
 
     def _subscriptions(self, prepared: List[Prepared]) -> List[Subscription]:
         """Every (application, consulate) calendar the booking phase will read."""
@@ -707,21 +778,20 @@ class Worker:
     ) -> Dict[Tuple[str, int], Optional[List[date]]]:
         """``(schedule_id, facility_id) -> days`` for every subscriber covered.
 
-        Answers a subscriber got from another schedule_id on the strength of a
-        declared ``visa_type`` (a canary, or a sibling) are remembered in
-        ``_borrowed`` so a hit on them is confirmed by the subscriber itself
-        before booking.
+        Answers a subscriber got from a canary are remembered in ``_borrowed``
+        so a hit on them is confirmed by the subscriber itself before booking.
         """
         calendars: Dict[Tuple[str, int], Optional[List[date]]] = {}
         for res in results:
             for schedule_id in res.poll.covers:
                 key = (schedule_id, res.poll.facility_id)
                 calendars[key] = res.days
-                # Only sharing that rests on a declared visa_type is unproven;
-                # ETag-matched sharing already showed the calendar is identical.
+                # A canary's answer is ETag-matched, but only as of its last
+                # calibration; a hit on it is re-read by the subscriber. Sharing
+                # between real applications needs no second read.
                 if (
-                    res.poll.label
-                    and res.poller is not None
+                    res.poller is not None
+                    and res.poller.canary
                     and res.poller.schedule_id != schedule_id
                 ):
                     self._borrowed[key] = res.poller.schedule_id

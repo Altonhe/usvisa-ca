@@ -80,16 +80,18 @@ max_concurrent_requests: 3
 # Ask for each calendar once for the whole account pool. days.json for a
 # given (visa class, consulate) is the same resource whichever schedule_id
 # asks -- the server returns one ETag for all of them -- so one request, from
-# any account holding that class (a canary first), answers every application
-# of it. Membership comes from `visa_type` where set, and from observed ETags
-# otherwise. A declared visa_type is trusted as is -- ETags never override it.
-# When an answer borrowed on the strength of visa_type (from a canary or a
-# sibling) shows a bookable day, the application re-reads days.json on its own
-# account and acts only on that, so a wrong visa_type can never cause a wrong
-# booking (though a wrong canary can hide days the application would see).
+# any schedule_id proven to see that calendar (a canary first), answers every
+# application of it. "Proven" means matching ETags: on its first sweep each
+# application asks for its own calendar while every canary asks for the same
+# consulate, and only the canaries whose ETag matched are used for it. The same
+# visa_type can still hide different calendars (PR vs non-PR applicants), so a
+# declared visa_type is never enough on its own. An empty calendar proves
+# nothing (all empty answers share one ETag); the application then polls
+# itself. A hit read from a canary is re-read on the application's own account
+# before booking.
 calendar_sharing: true
-# Sweeps between forced re-checks of ETag-based sharing, for applications
-# WITHOUT a visa_type. Costs the full request count for those once per N.
+# Each application is re-matched every N sweeps, which drops a canary whose
+# calendar drifted and picks up one that started matching.
 calendar_reverify_sweeps: 10
 
 # --- Booking speed ----------------------------------------------------------
@@ -233,9 +235,9 @@ dashboard:
 defaults:
   consulates: [TRT]
   # Visa class label, compared for equality only ("B1/B2", "F1", ...).
-  # Optional, but it is what lets one request -- possibly from a canary --
-  # serve every application of a class. Set per account or per application
-  # to override.
+  # Optional hint: a canary with a different declared visa_type is never
+  # tried for this application. Matching itself is always done by ETag.
+  # Set per account or per application to override.
   # visa_type: B1/B2
   earliest_acceptable_date: 2026-09-01
   latest_acceptable_date: 2026-12-30
@@ -296,9 +298,9 @@ accounts:
 
   # A canary only reads calendars; it is never booked. Any account whose
   # days.json still answers works -- including one whose visa was issued long
-  # ago. It needs the schedule_id to ask with and a visa_type, which is how it
-  # is matched to the applications it probes for (verified from ETags; a
-  # mismatch just means it is not used for that class). Polling prefers
+  # ago. It needs the schedule_id to ask with; it is matched to applications
+  # by ETag (a mismatch just means it is not used for them). visa_type is an
+  # optional hint that keeps it from being tried for other types. Polling prefers
   # canaries, so add more of them to spread the load and keep your real
   # accounts quiet.
   # - name: Canary-B2

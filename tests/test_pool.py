@@ -24,6 +24,7 @@ TRT, VAN = 94, 95
 B2 = 'W/"b2"'
 F1 = 'W/"f1"'
 DAY = date(2026, 10, 20)
+DAY_LATE = date(2027, 6, 1)        # outside every test window
 
 
 # ---------------------------------------------------------------------------
@@ -35,92 +36,147 @@ def subs(*items):
     return [Subscription(a, s, f, t) for a, s, f, t in items]
 
 
-def answer(planner, plan, etags):
-    """Feed the planner the ETags each polled schedule_id 'returned'."""
+def answer(planner, plan, etags, days=None):
+    """Feed the planner the ETags each polled schedule_id 'returned'.
+
+    Every answer carries one day unless ``days`` overrides it: an empty
+    calendar is no ETag evidence, so tests about matching need a day.
+    """
     from app.planner import PollResult
-    results = [PollResult(p, p.poller, [], etags.get(p.poller.schedule_id))
+    days = days or {}
+    results = [PollResult(p, p.poller, days.get(p.poller.schedule_id, [DAY]),
+                          etags.get(p.poller.schedule_id))
                for p in plan.polls]
     planner.observe(plan, results)
     return results
 
 
-def test_declared_class_is_shared_from_the_first_sweep():
+def calibrate(planner, wanted, canaries, etags, sweep=1):
+    plan = planner.plan(wanted, canaries, sweep)
+    answer(planner, plan, etags)
+    return plan
+
+
+def test_first_sweep_calibrates_every_target_against_every_canary():
     planner = CalendarPlanner(reverify_sweeps=100)
-    canary = Poller("C", "900", "B2", canary=True)
-    wanted = subs(("A", "1", TRT, "B2"), ("B", "2", TRT, "B2"))
-
-    plan = planner.plan(wanted, [canary], sweep=1)
-    assert len(plan.polls) == 1, "no verification round: the config is trusted"
-    poll = plan.polls[0]
-    assert poll.poller.canary, "a same-type canary is preferred"
-    assert set(poll.covers) == {"1", "2"}
-    assert [c.account for c in poll.candidates][0] == "C"
-    assert {c.account for c in poll.candidates[1:]} == {"A", "B"}, \
-        "subscribers stay behind the canary as fallbacks"
-
-
-def test_etag_disagreement_never_splits_a_declared_class():
-    planner = CalendarPlanner(reverify_sweeps=5)
-    canary = Poller("C", "900", "B2", canary=True)
-    wanted = subs(("A", "1", TRT, "B2"), ("B", "2", TRT, "B2"))
-    for n in range(1, 11):                     # includes re-verify sweeps
-        plan = planner.plan(wanted, [canary], n)
-        assert len(plan.polls) == 1
-        assert plan.polls[0].poller.canary
-        answer(planner, plan, {"900": F1})     # the canary "is really F1"
-
-
-def test_requests_spread_over_canaries():
-    planner = CalendarPlanner(reverify_sweeps=100)
-    canaries = [Poller("C1", "901", "B2", True), Poller("C2", "902", "B2", True)]
-    wanted = subs(("A", "1", TRT, "B2"), ("A", "1", VAN, "B2"))
+    canaries = [Poller("C1", "901", None, True), Poller("C2", "902", None, True)]
+    wanted = subs(("A", "1", TRT, None))
     plan = planner.plan(wanted, canaries, 1)
-    assert sorted(p.poller.account for p in plan.polls) == ["C1", "C2"]
+    kinds = sorted((p.poller.schedule_id, p.kind) for p in plan.polls)
+    assert kinds == [("1", "solo"), ("901", "calibrate"), ("902", "calibrate")]
 
 
-def test_work_rotates_over_every_canary_across_sweeps():
-    """3 calendars, 4 canaries: no canary may sit idle, none may carry more."""
+def test_each_target_gets_only_the_canaries_whose_etag_matched():
+    """Target 1 <- canaries A, B; target 2 <- canaries C, D, E."""
+    planner = CalendarPlanner(reverify_sweeps=100)
+    canaries = [Poller(n, s, "B1/B2", True) for n, s in
+                (("CA", "91"), ("CB", "92"), ("CC", "93"), ("CD", "94"), ("CE", "95"))]
+    wanted = subs(("A", "1", TRT, "B1/B2"), ("B", "2", TRT, "B1/B2"))
+    pr, non_pr = 'W/"pr"', 'W/"nonpr"'
+    calibrate(planner, wanted, canaries, {
+        "1": pr, "91": pr, "92": pr,
+        "2": non_pr, "93": non_pr, "94": non_pr, "95": non_pr,
+    })
+
+    assert {c.account for c in planner.matches("1", TRT, canaries)} == {"CA", "CB"}
+    assert {c.account for c in planner.matches("2", TRT, canaries)} == {"CC", "CD", "CE"}
+
+    plan = planner.plan(wanted, canaries, 2)
+    assert len(plan.polls) == 2, "one request per calendar class"
+    for poll in plan.polls:
+        assert poll.poller.canary
+        allowed = {"1": {"CA", "CB"}, "2": {"CC", "CD", "CE"}}[poll.covers[0]]
+        assert poll.poller.account in allowed, "never a canary of the other class"
+        assert {c.account for c in poll.candidates if c.canary} == allowed
+
+
+def test_a_target_nobody_matches_polls_itself():
+    planner = CalendarPlanner(reverify_sweeps=100)
+    canaries = [Poller("C", "900", None, True)]
+    wanted = subs(("A", "1", TRT, None))
+    calibrate(planner, wanted, canaries, {"1": 'W/"x"', "900": 'W/"y"'})
+    plan = planner.plan(wanted, canaries, 2)
+    assert [(p.poller.schedule_id, p.covers) for p in plan.polls] == [("1", ("1",))]
+
+
+def test_a_declared_type_only_rules_a_canary_out():
+    planner = CalendarPlanner(reverify_sweeps=100)
+    canaries = [Poller("CF", "901", "F1", True), Poller("CU", "902", None, True)]
+    plan = planner.plan(subs(("A", "1", TRT, "B1/B2")), canaries, 1)
+    probed = {p.poller.account for p in plan.polls if p.kind == "calibrate"}
+    assert probed == {"CU"}, "F1 canary is not tried for a B1/B2 target"
+
+
+def test_an_empty_calendar_proves_nothing():
+    planner = CalendarPlanner(reverify_sweeps=100)
+    canaries = [Poller("C", "900", None, True)]
+    wanted = subs(("A", "1", TRT, None))
+    plan = planner.plan(wanted, canaries, 1)
+    empty = 'W/"empty"'
+    answer(planner, plan, {"1": empty, "900": empty}, days={"1": [], "900": []})
+    assert planner.matches("1", TRT, canaries) == []
+    assert not planner.plan(wanted, canaries, 2).polls[0].poller.canary
+
+
+def test_recalibration_drops_a_canary_that_drifted_and_adds_one_that_matches():
+    planner = CalendarPlanner(reverify_sweeps=5)
+    canaries = [Poller("C1", "901", None, True), Poller("C2", "902", None, True)]
+    wanted = subs(("A", "1", TRT, None))
+    calibrate(planner, wanted, canaries, {"1": B2, "901": B2, "902": F1}, sweep=1)
+    assert [c.account for c in planner.matches("1", TRT, canaries)] == ["C1"]
+
+    for n in range(2, 6):            # settled: no ETag checks in between
+        plan = planner.plan(wanted, canaries, n)
+        assert len(plan.polls) == 1 and plan.polls[0].poller.account == "C1"
+        answer(planner, plan, {"901": B2})
+
+    plan = planner.plan(wanted, canaries, 6)
+    assert any(p.kind == "calibrate" for p in plan.polls), "re-verify after 5 sweeps"
+    answer(planner, plan, {"1": B2, "901": F1, "902": B2})
+    assert [c.account for c in planner.matches("1", TRT, canaries)] == ["C2"]
+
+
+def test_new_target_joins_a_settled_class_without_splitting_it():
+    planner = CalendarPlanner(reverify_sweeps=100)
+    canaries = [Poller("C1", "901", None, True), Poller("C2", "902", None, True)]
+    calibrate(planner, subs(("A", "1", TRT, None)), canaries,
+              {"1": B2, "901": B2, "902": B2})
+
+    wanted = subs(("A", "1", TRT, None), ("B", "2", TRT, None))
+    plan = planner.plan(wanted, canaries, 2)
+    # Target 2 calibrates; target 1's class rides on one canary's check.
+    assert len(plan.polls) == 3, [(p.poller.schedule_id, p.covers) for p in plan.polls]
+    answer(planner, plan, {"1": B2, "2": B2, "901": B2, "902": B2})
+    assert {c.account for c in planner.matches("2", TRT, canaries)} == {"C1", "C2"}
+    plan = planner.plan(wanted, canaries, 3)
+    assert len(plan.polls) == 1 and set(plan.polls[0].covers) == {"1", "2"}
+
+
+def test_work_rotates_over_every_matching_canary_across_sweeps():
+    """3 calendars, 4 matching canaries: none idle, none carries more."""
     import random
     from collections import Counter
-    planner = CalendarPlanner(reverify_sweeps=1000, rng=random.Random(7))
-    canaries = [Poller(f"C{i}", f"90{i}", "B2", True) for i in range(4)]
-    wanted = subs(("A", "1", TRT, "B2"), ("A", "1", 91, "B2"),
-                  ("B", "2", VAN, "B2"))
+    planner = CalendarPlanner(reverify_sweeps=100000, rng=random.Random(7))
+    canaries = [Poller(f"C{i}", f"90{i}", None, True) for i in range(4)]
+    wanted = subs(("A", "1", TRT, None), ("A", "1", 91, None),
+                  ("B", "2", VAN, None))
+    calibrate(planner, wanted, canaries, {s: B2 for s in ("1", "2", "900", "901", "902", "903")})
 
     used = Counter()
-    for n in range(1, 401):
+    for n in range(2, 402):
         plan = planner.plan(wanted, canaries, n)
         accounts = [p.poller.account for p in plan.polls]
         assert len(set(accounts)) == 3, "one sweep still spreads over 3 canaries"
         used.update(accounts)
     assert set(used) == {"C0", "C1", "C2", "C3"}
-    # 1200 draws over 4 canaries: 300 each in expectation.
     assert all(240 <= n <= 360 for n in used.values()), used
 
 
-def test_adding_a_canary_takes_load_off_the_others():
-    import random
-    from collections import Counter
-    wanted = subs(("A", "1", TRT, "B2"))
-    for count in (1, 2, 4):
-        planner = CalendarPlanner(reverify_sweeps=1000, rng=random.Random(3))
-        canaries = [Poller(f"C{i}", f"90{i}", "B2", True) for i in range(count)]
-        used = Counter(planner.plan(wanted, canaries, n).polls[0].poller.account
-                       for n in range(1, 801))
-        share = 800 / count
-        assert len(used) == count
-        assert all(0.8 * share <= n <= 1.2 * share for n in used.values()), used
-
-
-def test_untyped_applications_still_share_on_etag_evidence():
+def test_siblings_with_the_same_etag_share_without_a_canary():
     planner = CalendarPlanner(reverify_sweeps=100)
     wanted = subs(("A", "1", TRT, None), ("B", "2", TRT, None))
-    first = planner.plan(wanted, [], 1)
-    assert len(first.polls) == 2
-    answer(planner, first, {"1": B2, "2": B2})
-
-    second = planner.plan(wanted, [], 2)
-    assert len(second.polls) == 1, "same ETag across accounts -> one request"
+    calibrate(planner, wanted, [], {"1": B2, "2": B2})
+    assert len(planner.plan(wanted, [], 2).polls) == 1
 
 
 def test_sharing_disabled_polls_everyone():
@@ -151,7 +207,7 @@ class PoolClient:
         if self.fail_days:
             return None, None
         etag = self.classes[schedule_id]
-        return ([DAY] if etag == B2 else []), etag
+        return ([DAY] if etag == B2 else [DAY_LATE]), etag
 
     def get_available_days(self, schedule_id, facility_id):
         return self.get_available_days_meta(schedule_id, facility_id)[0]
@@ -231,33 +287,55 @@ def test_canary_carries_the_polling_and_the_subscriber_books(tmp_path):
                    {"A": sub, "C": can})
 
     sweep(worker, 1)
-    assert can.calls == [("900", TRT)], "the canary polls from the first sweep"
+    assert sub.calls == [("111", TRT)] and can.calls == [("900", TRT)], \
+        "first sweep: target and canary each ask once, to compare ETags"
+    sub.calls.clear(); can.calls.clear(); sub.booked.clear()
+
+    sweep(worker, 2)
+    assert can.calls == [("900", TRT)], "matched: the canary polls"
     assert sub.calls == [("111", TRT)], "the subscriber asks only to confirm the hit"
     assert [s.schedule_id for s in sub.booked] == ["111"], \
         "booking still happens on the subscriber's own session"
     assert sub.booked[0].day == DAY
 
 
-def test_quiet_canary_costs_the_subscriber_nothing(tmp_path):
-    sub = PoolClient(["111"], {"111": B2})
-    can = PoolClient(["900"], {"900": F1})    # answers with no days
+def test_matched_canary_without_a_hit_costs_the_subscriber_nothing(tmp_path):
+    sub = PoolClient(["111"], {"111": F1})    # days, but outside the window
+    can = PoolClient(["900"], {"900": F1})
     worker = build(tmp_path, [subscriber("A", "111"), canary("C", "900")],
                    {"A": sub, "C": can})
     sweep(worker, 1)
+    sub.calls.clear()
     sweep(worker, 2)
+    sweep(worker, 3)
     assert sub.calls == [], "nothing to confirm, so the subscriber never polls"
-    assert len(can.calls) == 2
+    assert len(can.calls) == 3
+
+
+def test_mismatched_canary_is_never_used_for_the_target(tmp_path):
+    """Same declared visa_type, different calendar (e.g. PR vs non-PR)."""
+    sub = PoolClient(["111"], {"111": B2})
+    can = PoolClient(["900"], {"900": F1})
+    worker = build(tmp_path, [subscriber("A", "111"), canary("C", "900")],
+                   {"A": sub, "C": can})
+    sweep(worker, 1)
+    sub.calls.clear(); can.calls.clear()
+    sweep(worker, 2)
+    assert can.calls == [], "the canary's ETag did not match"
+    assert sub.calls == [("111", TRT)], "the target polls itself"
 
 
 def test_canary_hit_the_subscriber_cannot_see_is_not_booked(tmp_path):
-    sub = PoolClient(["111"], {"111": F1})    # its own calendar: nothing
-    can = PoolClient(["900"], {"900": B2})    # canary reports DAY
+    sub = PoolClient(["111"], {"111": B2})
+    can = PoolClient(["900"], {"900": B2})
     worker = build(tmp_path, [subscriber("A", "111"), canary("C", "900")],
                    {"A": sub, "C": can})
     sweep(worker, 1)
+    sub.calls.clear(); sub.booked.clear()
+    sub.classes["111"] = F1                   # drifted since calibration
+    sweep(worker, 2)
     assert sub.calls == [("111", TRT)], "the hit was re-read on the own account"
     assert sub.booked == [], "and the subscriber's own answer decided"
-
 
 def test_canary_is_not_shown_as_an_application(tmp_path):
     worker = build(tmp_path, [subscriber("A", "111"), canary("C", "900")],
@@ -392,11 +470,10 @@ def test_canary_needs_a_schedule_id(tmp_path):
         load_config(write(tmp_path, text))
 
 
-def test_canary_needs_a_visa_type(tmp_path):
+def test_canary_visa_type_is_optional(tmp_path):
     text = CFG.replace("  visa_type: b1 / b2\n", "")
-    with pytest.raises(ConfigError, match="visa_type"):
-        load_config(write(tmp_path, text))
-
+    cfg = load_config(write(tmp_path, text))
+    assert cfg.accounts[1].canary and cfg.accounts[1].applications[0].visa_type is None
 
 def test_all_canaries_is_rejected(tmp_path):
     text = """
@@ -407,3 +484,19 @@ accounts:
 """
     with pytest.raises(ConfigError, match="nothing to book"):
         load_config(write(tmp_path, text))
+
+def test_dashboard_shows_which_canaries_each_applicant_uses(tmp_path):
+    worker = build(tmp_path, [subscriber("A", "111"), canary("C1", "901"),
+                              canary("C2", "902"), canary("C3", "903")],
+                   {"A": PoolClient(["111"], {"111": B2}),
+                    "C1": PoolClient(["901"], {"901": B2}),
+                    "C2": PoolClient(["902"], {"902": B2}),
+                    "C3": PoolClient(["903"], {"903": F1})})
+    sweep(worker, 1)
+    sweep(worker, 2)
+    rows = worker.dashboard_context()["matching"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["schedule_id"] == "111" and row["state"] == "matched"
+    assert row["canaries"] == ["C1", "C2"], "C3 returned another ETag"
+    assert row["answered_by"] in {"C1", "C2"}

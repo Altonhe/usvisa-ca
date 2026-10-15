@@ -82,6 +82,8 @@ def create_app(config: Config, store: Store, worker: Optional[Worker] = None) ->
                 "groups": worker_context["groups"],
                 "sessions": worker_context["sessions"],
                 "pool": worker_context.get("pool", []),
+                "matching": worker_context.get("matching", []),
+                "reverify_sweeps": config.calendar_reverify_sweeps,
                 "network": worker_context.get("network", {"enabled": False}),
             },
         )

@@ -31,7 +31,7 @@ B2_MTL = 'W/"4f53cda1"'
 OTHER_TRT = 'W/"6532a9c6"'     # same consulate, different visa class
 
 # Real calendars, per (schedule_id class, facility).
-B2 = {TRT: [date(2028, 3, 16)], VAN: [date(2027, 10, 26)], MTL: []}
+B2 = {TRT: [date(2028, 3, 16)], VAN: [date(2027, 10, 26)], MTL: [date(2027, 12, 1)]}
 OTHER = {TRT: [date(2027, 7, 29)]}
 
 

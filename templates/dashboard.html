@@ -116,6 +116,7 @@
     display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline;
   }
   .panel-body { padding: 12px 16px; }
+  .muted { color: var(--muted); font-size: 12px; }
   .kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px 18px; margin: 0; }
   .kv dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
   .kv dd { margin: 2px 0 0; font-size: 13px; word-break: break-all; }
@@ -395,6 +396,41 @@
       ban: it rests and the rest of the pool covers its calendars. When every
       account fails at once the egress IP is probed instead, and an IP ban
       rotates the OpenVPN profile rather than resting anyone.
+    </div>
+  </section>
+  {% endif %}
+
+  {% if matching %}
+  <h1 style="font-size:14px;margin:24px 0 10px">Canary matching</h1>
+  <section class="panel">
+    <table>
+      <thead>
+        <tr><th>Applicant</th><th>Account</th><th>Consulate</th><th>State</th><th>Matched canaries</th><th>Answered by (last sweep)</th></tr>
+      </thead>
+      <tbody>
+      {% for m in matching %}
+        <tr>
+          <td>{{ m.name }}{% if m.visa_type %} <span class="muted">{{ m.visa_type }}</span>{% endif %}</td>
+          <td>{{ m.account }}</td>
+          <td>{{ m.consulate }}</td>
+          <td>
+            {% if m.state == 'matched' %}<span class="pill available">matched</span>
+            {% elif m.state == 'no match' %}<span class="pill resting">no match</span>
+            {% else %}<span class="pill">checking</span>{% endif %}
+          </td>
+          <td>
+            {% for c in m.canaries %}<span class="pill canary">{{ c }}</span> {% else %}<span class="muted">none -- polls itself</span>{% endfor %}
+          </td>
+          <td>{{ m.answered_by or 'failed' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="group-note">
+      Each applicant asks for its own calendar while every canary asks for the
+      same consulate in the same sweep; only canaries that returned the same
+      ETag are used for it. Re-checked every {{ reverify_sweeps }} sweeps. An
+      empty calendar proves nothing, so it shows "no match" until days appear.
     </div>
   </section>
   {% endif %}

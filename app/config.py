@@ -211,11 +211,11 @@ class Application:
     schedule_id: str = ""
     label: str = ""
     target: Target = field(default_factory=Target)
-    # Visa class, as a free-form label ("B1/B2", "F1"...). Only ever compared
-    # for equality: two applications with the same label at one consulate are
-    # assumed to share a calendar, which lets one request (possibly from a
-    # canary account) answer for all of them. The assumption is verified from
-    # the server's ETags and corrected on its own when it is wrong.
+    # Visa class, as a free-form label ("B1/B2", "F1"...). Optional hint only:
+    # which schedule_ids share a calendar is decided by matching the server's
+    # ETags (the same label can still hide different calendars, e.g. PR vs
+    # non-PR applicants in Canada). A declared type only stops a canary of a
+    # *different* declared type from being tried for this application.
     visa_type: Optional[str] = None
 
     @property
@@ -555,20 +555,13 @@ def _parse_account(
         )
 
     if canary:
-        # A canary is matched to requirements by visa_type alone: it holds
-        # nothing to discover, so without both it could never be used.
+        # A canary is matched to targets by ETag on its schedule_id: it holds
+        # nothing to discover, so it must name the schedule_id(s) to probe with.
         if not applications:
             raise ConfigError(
                 f"{label} ({name!r}) is a canary, so it needs an explicit "
                 "applications list with the schedule_id(s) to probe with"
             )
-        for j, app in enumerate(applications):
-            if not app.visa_type:
-                raise ConfigError(
-                    f"{label}.applications[{j}] ({name!r}) is a canary without "
-                    "a visa_type; set it on the application or the account so "
-                    "it can be matched to the applications it probes for"
-                )
         if raw.get("groups"):
             raise ConfigError(
                 f"{label} ({name!r}) is a canary and is never booked, so it "

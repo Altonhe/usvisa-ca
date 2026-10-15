@@ -37,12 +37,36 @@ from curl_cffi.requests.exceptions import (  # noqa: F401 - re-exported
 IMPERSONATE = "chrome"
 
 
+def site_replied(status: int) -> bool:
+    """Did the *application* answer, as opposed to a WAF, proxy or outage?
+
+    401, 404, a redirect, a JSON error: the request crossed the egress and
+    reached the site, so the address is not banned. 403/429 are what a ban
+    looks like, 407 is the proxy, and 5xx says nothing about the address
+    (maintenance is told apart by the network guard's own probe).
+    """
+    return status < 500 and status not in (403, 407, 429)
+
+
 class Session(_curl.Session):
-    """A curl_cffi session that impersonates Chrome unless told otherwise."""
+    """A curl_cffi session that impersonates Chrome unless told otherwise.
+
+    ``site_replies`` counts responses for which :func:`site_replied` holds.
+    The worker reads it to learn that the egress works from requests it made
+    anyway, so a sweep that failed for account reasons (an expired session,
+    a locked account) needs no extra egress probe.
+    """
 
     def __init__(self, **kwargs: Any) -> None:
         kwargs.setdefault("impersonate", IMPERSONATE)
         super().__init__(**kwargs)
+        self.site_replies = 0
+
+    def request(self, *args: Any, **kwargs: Any) -> Response:  # type: ignore[override]
+        resp = super().request(*args, **kwargs)
+        if site_replied(resp.status_code):
+            self.site_replies += 1
+        return resp
 
 
 def request(method: str, url: str, **kwargs: Any) -> Response:

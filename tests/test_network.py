@@ -525,3 +525,21 @@ def test_dashboard_switch_needs_the_xhr_header(tmp_path):
     page = http.get("/")
     assert page.status_code == 200
     assert "Network egress" in page.text and "Account pool" in page.text
+
+def test_a_site_reply_clears_the_egress_without_a_probe(tmp_path):
+    """Every request failed, but the site answered (e.g. 404/JSON error): no probe."""
+    g = StubGuard("ip")
+    clients = {"A": Client("1", fail=True), "B": Client("2", fail=True)}
+    w = build(tmp_path, clients, network=g)
+    warm(w, clients)
+
+    def replied_but_failed(schedule_id, facility_id, c=clients["A"]):
+        c.session.site_replies += 1        # the app answered, just not with days
+        return None, None
+    clients["A"].get_available_days_meta = replied_but_failed
+
+    w.store.sweep_count = 2
+    w._sweep()
+    assert g.classified == 0, "the site answered, so the egress is proven"
+    assert g.recovered == 0
+    assert w._failures["A"] == 1 and w._failures["B"] == 1, "charged to the accounts"

@@ -46,7 +46,8 @@ class CountingClient:
                 # A real request takes ~200ms; without some duration here there
                 # is no window in which overlap could be observed at all.
                 time.sleep(self.delay)
-            days = self.days.get((schedule_id, facility_id), [])
+            # Non-empty by default: an empty calendar is no ETag evidence.
+            days = self.days.get((schedule_id, facility_id), [date(2099, 1, 1)])
             return days, self.etags.get((schedule_id, facility_id))
         finally:
             with self._lock:
@@ -109,7 +110,7 @@ def test_reverify_sweep_restores_the_full_request_count(tmp_path):
     assert len(client.calls) == 1
     client.calls.clear()
 
-    worker.store.sweep_count = 5          # re-verifies
+    worker.store.sweep_count = 6          # 5 sweeps after calibrating: re-verifies
     worker._fetch_calendars(account, client, pairs)
     assert len(client.calls) == 2
 

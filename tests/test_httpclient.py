@@ -79,3 +79,18 @@ def test_changing_egress_leaves_the_session_usable(local_server):
     guard.apply(session)                  # -> back to direct
     assert session.proxies == {}
     assert session.get(url, timeout=5).status_code == 200
+
+@pytest.mark.parametrize("status, replied", [
+    (200, True), (302, True), (304, True), (401, True), (404, True), (422, True),
+    (403, False), (407, False), (429, False), (500, False), (503, False),
+])
+def test_site_replied_separates_the_app_from_a_ban(status, replied):
+    assert http.site_replied(status) is replied
+
+
+def test_session_counts_site_replies(local_server):
+    url, _ = local_server
+    session = http.Session()
+    assert session.site_replies == 0
+    session.get(url + "/x", timeout=5)
+    assert session.site_replies == 1
