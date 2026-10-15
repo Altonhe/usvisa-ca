@@ -1,4 +1,4 @@
-"""Pure-``requests`` client for the AIS visa appointment system (Canada).
+"""Pure-HTTP (``curl_cffi``) client for the AIS visa appointment system (Canada).
 
 Everything the old Selenium implementation did by clicking is done here over
 HTTP.  Endpoint paths and field names below were all read off the live site:
@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlencode
 
-import requests
+from . import httpclient as http
 
 from .capsolver import CapSolver
 from .consulates import consulate_name
@@ -191,16 +191,13 @@ class AisClient:
         # Pre-warmed booking form state, keyed by schedule_id.
         self._prewarmed: Dict[str, "PrewarmedForm"] = {}
         self._prewarm_lock = threading.Lock()
-        self.session = requests.Session()
-        # The availability sweep fires several days.json calls at once and the
-        # host is HTTP/1.1, so each concurrent call needs its own connection.
-        # Without raising this urllib3 would warn and serialise them.
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=max_connections,
-            pool_maxsize=max_connections,
-        )
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
+        # curl_cffi with a Chrome TLS fingerprint. The availability sweep fires
+        # several days.json calls at once; the session keeps one libcurl handle
+        # per thread, so concurrent calls each get their own connection while
+        # sharing one cookie jar. ``max_connections`` is kept for API
+        # compatibility and no longer needs a pool to be sized.
+        self.max_connections = max_connections
+        self.session = http.Session()
         self.session.headers.update({
             "User-Agent": user_agent or (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -262,11 +259,11 @@ class AisClient:
                 resp = self.session.get(url, headers=headers, timeout=self.timeout)
                 resp.raise_for_status()
                 return Page(resp.text, base_url=resp.url)
-            except (requests.Timeout, requests.ConnectionError) as exc:
+            except (http.Timeout, http.ConnectionError) as exc:
                 last = exc
                 if attempt == 0:
                     self._log(
-                        f"{type(exc).__name__} on {url.rsplit('/', 2)[-2:][0]}…, "
+                        f"{type(exc).__name__} on {url.rsplit('/', 2)[-2:][0]}鈥? "
                         "retrying once"
                     )
                     time.sleep(2)
@@ -316,7 +313,7 @@ class AisClient:
 
         try:
             resp = self.session.get(url, headers=headers, timeout=self.timeout)
-        except requests.RequestException as exc:
+        except http.RequestException as exc:
             self._log(f"request failed: {exc}")
             return None, None, False
 
@@ -345,7 +342,7 @@ class AisClient:
                 self._etag_cache[url] = (etag, payload)
         return payload, etag, False
 
-    def _post_form(self, url: str, payload: Dict[str, str], page: Page) -> requests.Response:
+    def _post_form(self, url: str, payload: Dict[str, str], page: Page) -> http.Response:
         return self.session.post(
             url,
             data=payload,
@@ -463,7 +460,7 @@ class AisClient:
         # Not signed in: re-read the login page for the actual reason.
         try:
             reason = self._login_error_reason(self._get_page(self.login_url))
-        except requests.RequestException:
+        except http.RequestException:
             reason = f"landed on {resp.url} (HTTP {resp.status_code})"
         raise LoginFailed(f"sign in rejected ({reason})")
 
@@ -473,7 +470,7 @@ class AisClient:
             resp = self.session.get(
                 self.account_home_url, timeout=self.timeout, allow_redirects=True
             )
-        except requests.RequestException:
+        except http.RequestException:
             return False
         return "/niv/groups/" in resp.url
 
@@ -488,7 +485,7 @@ class AisClient:
             resp = self.session.get(
                 self.account_home_url, timeout=self.timeout, allow_redirects=True
             )
-        except requests.RequestException as exc:
+        except http.RequestException as exc:
             self._log(f"could not verify the saved session: {exc}")
             return False
         landed = Page(resp.text, base_url=resp.url)
@@ -509,7 +506,7 @@ class AisClient:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
-                "cookies": requests.utils.dict_from_cookiejar(self.session.cookies),
+                "cookies": self.session.cookies.get_dict(),
                 "landing_url": self.landing_url,
             }
             tmp = path.with_suffix(path.suffix + ".tmp")
@@ -528,9 +525,7 @@ class AisClient:
             cookies = payload.get("cookies") or {}
             if not cookies:
                 return False
-            self.session.cookies.update(
-                requests.utils.cookiejar_from_dict(cookies)
-            )
+            self.session.cookies.update(cookies)
             self.landing_url = payload.get("landing_url") or ""
             return True
         except (OSError, ValueError, KeyError, AttributeError) as exc:
@@ -647,7 +642,7 @@ class AisClient:
                 if found:
                     return found
             page = self._get_page(self.continue_actions_url(schedule_id))
-        except (requests.RequestException, AisError) as exc:
+        except (http.RequestException, AisError) as exc:
             self._log(f"could not re-read schedule {schedule_id}: {exc}")
             return None
         m = CONSULAR_APPT_RE.search(page.text)
@@ -815,7 +810,7 @@ class AisClient:
                 fetched_at=time.monotonic(),
                 known_times={},
             )
-        except (AisError, requests.RequestException) as exc:
+        except (AisError, http.RequestException) as exc:
             self._log(f"prewarm failed for {schedule_id} (ignored): {exc}")
             return None
 

@@ -75,8 +75,7 @@ def test_resume_session_fails_when_session_has_lapsed(monkeypatch):
 
 
 def test_resume_session_false_on_network_error(monkeypatch):
-    import requests
-
+    from app import httpclient as requests
     client = make_client()
 
     def boom(*a, **k):

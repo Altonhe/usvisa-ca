@@ -523,8 +523,9 @@ def _parse_account(
         raise ConfigError(f"{label}.email is required (account {name!r})")
     if not password:
         raise ConfigError(
-            f"{label}.password is empty for {name!r}. Set it in config.yaml (if you "
-            "used ${VAR}, make sure that variable is exported)."
+            f"{label}.password is empty for {name!r}. Set it in config.yaml, or "
+            "store it in Infisical as <NAME>_PASSWORD when a secrets: block is "
+            "configured (if you used ${VAR}, make sure that variable is exported)."
         )
 
     account_target = _parse_target(raw, defaults, label)
@@ -638,6 +639,15 @@ def load_config(path: Optional[Path] = None) -> Config:
     accounts_raw = raw.get("accounts") or []
     if not isinstance(accounts_raw, list) or not accounts_raw:
         raise ConfigError("accounts: at least one account is required")
+    secrets_raw = raw.get("secrets")
+    if secrets_raw:
+        if not isinstance(secrets_raw, dict):
+            raise ConfigError("secrets: expected a mapping")
+        from .secrets import SecretsError, fill_account_credentials
+        try:
+            fill_account_credentials(accounts_raw, secrets_raw)
+        except SecretsError as exc:
+            raise ConfigError(f"secrets: {exc}") from exc
     accounts = [
         _parse_account(a, defaults, i, default_visa_type)
         for i, a in enumerate(accounts_raw)

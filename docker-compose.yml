@@ -15,6 +15,10 @@ services:
       # both to empty in .env to talk to the site directly instead.
       OPENVPN_PROVIDER_URL: ${OPENVPN_PROVIDER_URL-http://openvpn-provider:8080}
       AIS_PROXY: ${AIS_PROXY-socks5h://openvpn-socks:1080}
+      # Machine identity for config.yaml's `secrets:` block (account e-mails
+      # and passwords are fetched from Infisical at startup).
+      INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID-}
+      INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET-}
 
     # Optional escape hatch for hosts running a DNS-level blocker. AdGuard,
     # Pi-hole and hosts-file blockers resolve newrelic.com to 0.0.0.0 as a

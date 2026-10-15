@@ -9,7 +9,6 @@ license = { file = "LICENSE" }
 # Exact versions are pinned in uv.lock; the ranges here only express the
 # minimum each module was written against.
 dependencies = [
-    "requests[socks]>=2.32.3",
     "certifi>=2024.8.30",
     "urllib3>=2.2.3",
     "pyyaml>=6.0.2",
@@ -20,6 +19,7 @@ dependencies = [
     # host having a tz database, which neither Windows nor python:*-slim does.
     # Consulate-local hours would silently fail without this.
     "tzdata>=2024.1",
+    "curl-cffi>=0.16.3",
 ]
 
 [project.scripts]

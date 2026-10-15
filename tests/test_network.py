@@ -8,8 +8,7 @@ charged to no account and rotates the OpenVPN profile instead.
 from datetime import date
 
 import pytest
-import requests
-
+from app import httpclient as requests
 from app.ais_client import AisError, Schedule
 from app.config import (Account, Application, Config, ConfigError,
                         DashboardConfig, Target, TelegramConfig, load_config)

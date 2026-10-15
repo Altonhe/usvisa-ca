@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 from typing import Dict, Optional
 
-import requests
+from . import httpclient as http
 
 CREATE_TASK_URL = "https://api.capsolver.com/createTask"
 GET_TASK_RESULT_URL = "https://api.capsolver.com/getTaskResult"
@@ -112,7 +112,7 @@ class CapSolver:
     def balance(self) -> Optional[float]:
         """Account balance, or ``None`` if the endpoint is unavailable."""
         try:
-            resp = requests.post(
+            resp = http.post(
                 "https://api.capsolver.com/getBalance",
                 json={"clientKey": self.api_key},
                 timeout=self.request_timeout,
@@ -130,8 +130,8 @@ class CapSolver:
 
     def _post(self, url: str, payload: dict) -> dict:
         try:
-            resp = requests.post(url, json=payload, timeout=self.request_timeout)
-        except requests.RequestException as exc:
+            resp = http.post(url, json=payload, timeout=self.request_timeout)
+        except http.RequestException as exc:
             raise CapSolverError(f"CapSolver request to {url} failed: {exc}") from exc
         try:
             data = resp.json()

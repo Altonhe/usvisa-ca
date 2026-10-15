@@ -1,4 +1,4 @@
-"""New Relic Metric API client. No network: requests.post is stubbed."""
+"""New Relic Metric API client. No network: http.post is stubbed."""
 
 import gzip
 import json
@@ -28,7 +28,7 @@ def captured(monkeypatch):
         calls.append({"url": url, "data": data, "headers": headers or {}})
         return FakeResponse(202)
 
-    monkeypatch.setattr("app.newrelic.requests.post", fake_post)
+    monkeypatch.setattr("app.newrelic.http.post", fake_post)
     return calls
 
 
@@ -145,7 +145,7 @@ def test_large_payloads_are_gzipped(captured):
 def test_oversized_payloads_are_split(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        "app.newrelic.requests.post",
+        "app.newrelic.http.post",
         lambda url, data=None, headers=None, timeout=None: (
             calls.append(data) or FakeResponse(202)
         ),
@@ -179,7 +179,7 @@ def test_disabled_client_sends_nothing(captured):
 def test_error_statuses_are_reported_not_raised(monkeypatch, status, needle):
     logged = []
     monkeypatch.setattr(
-        "app.newrelic.requests.post",
+        "app.newrelic.http.post",
         lambda *a, **k: FakeResponse(status, "boom"),
     )
     client = NewRelicClient("K", logger=logged.append)
@@ -188,13 +188,13 @@ def test_error_statuses_are_reported_not_raised(monkeypatch, status, needle):
 
 
 def test_network_failure_is_swallowed(monkeypatch):
-    import requests as real_requests
+    from app import httpclient as real_requests
     logged = []
 
     def boom(*a, **k):
         raise real_requests.ConnectionError("no route to host")
 
-    monkeypatch.setattr("app.newrelic.requests.post", boom)
+    monkeypatch.setattr("app.newrelic.http.post", boom)
     client = NewRelicClient("K", logger=logged.append)
     assert client.send([Sample("up", 1, "h", {})]) is False
     assert any("request failed" in line for line in logged)
@@ -202,7 +202,7 @@ def test_network_failure_is_swallowed(monkeypatch):
 
 def test_repeated_failures_stop_flooding_the_log(monkeypatch):
     logged = []
-    monkeypatch.setattr("app.newrelic.requests.post",
+    monkeypatch.setattr("app.newrelic.http.post",
                         lambda *a, **k: FakeResponse(500, "err"))
     client = NewRelicClient("K", logger=logged.append)
     for _ in range(15):
@@ -252,7 +252,7 @@ def test_worker_survives_a_metrics_outage(monkeypatch):
     from app.notifier import TelegramNotifier
     from app.worker import Worker
 
-    monkeypatch.setattr("app.newrelic.requests.post",
+    monkeypatch.setattr("app.newrelic.http.post",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("nope")))
     config = Config(accounts=[], telegram=TelegramConfig(),
                     dashboard=DashboardConfig())
@@ -288,10 +288,10 @@ def test_blackholed_dns_is_explained(monkeypatch):
 
     refused", which looks like a New Relic outage. Say what it really is.
     """
-    import requests as real_requests
+    from app import httpclient as real_requests
 
     monkeypatch.setattr(
-        "app.newrelic.requests.post",
+        "app.newrelic.http.post",
         lambda *a, **k: (_ for _ in ()).throw(
             real_requests.ConnectionError("[Errno 111] Connection refused")
         ),
@@ -299,6 +299,13 @@ def test_blackholed_dns_is_explained(monkeypatch):
     monkeypatch.setattr(
         "app.newrelic.socket.getaddrinfo",
         lambda host, port, *a, **k: [(2, 1, 6, "", ("0.0.0.0", 443))],
+    )
+    # Keep the DoH fallback offline too: libcurl resolves on its own, so the
+    # getaddrinfo stub above no longer stops a real DoH lookup.
+    monkeypatch.setattr(
+        "app.newrelic.http.get",
+        lambda *a, **k: (_ for _ in ()).throw(
+            real_requests.ConnectionError("doh blocked")),
     )
     logged = []
     client = NewRelicClient("K", logger=logged.append)
@@ -310,10 +317,10 @@ def test_blackholed_dns_is_explained(monkeypatch):
 
 
 def test_healthy_dns_adds_no_hint(monkeypatch):
-    import requests as real_requests
+    from app import httpclient as real_requests
 
     monkeypatch.setattr(
-        "app.newrelic.requests.post",
+        "app.newrelic.http.post",
         lambda *a, **k: (_ for _ in ()).throw(
             real_requests.ConnectionError("timed out")
         ),
@@ -328,10 +335,10 @@ def test_healthy_dns_adds_no_hint(monkeypatch):
 
 
 def test_unresolvable_host_is_explained(monkeypatch):
-    import requests as real_requests
+    from app import httpclient as real_requests
 
     monkeypatch.setattr(
-        "app.newrelic.requests.post",
+        "app.newrelic.http.post",
         lambda *a, **k: (_ for _ in ()).throw(real_requests.ConnectionError("nope")),
     )
 
@@ -370,14 +377,14 @@ class FakePool:
 def doh_env(monkeypatch):
     """System DNS blackholed, DoH answering, urllib3 stubbed."""
     FakePool.created = []
-    import requests as real_requests
+    from app import httpclient as real_requests
 
     monkeypatch.setattr(
         "app.newrelic.socket.getaddrinfo",
         lambda host, port, *a, **k: [(2, 1, 6, "", ("0.0.0.0", 443))],
     )
     monkeypatch.setattr(
-        "app.newrelic.requests.post",
+        "app.newrelic.http.post",
         lambda *a, **k: (_ for _ in ()).throw(
             real_requests.ConnectionError("[Errno 111] Connection refused")
         ),
@@ -391,7 +398,7 @@ def doh_env(monkeypatch):
             }
         })()
 
-    monkeypatch.setattr("app.newrelic.requests.get", fake_get)
+    monkeypatch.setattr("app.newrelic.http.get", fake_get)
     monkeypatch.setattr("app.newrelic.urllib3.HTTPSConnectionPool", FakePool)
     return FakePool
 
@@ -434,7 +441,7 @@ def test_pin_is_reused_without_re_resolving(doh_env, monkeypatch):
             }
         })()
 
-    monkeypatch.setattr("app.newrelic.requests.get", counting_get)
+    monkeypatch.setattr("app.newrelic.http.get", counting_get)
     client = NewRelicClient("K", dns_mode="auto")
     client.send([Sample("up", 1, "h", {})])
     client.send([Sample("up", 1, "h", {})])
@@ -457,9 +464,9 @@ def test_doh_mode_skips_system_dns(monkeypatch):
     def should_not_be_called(*a, **k):
         raise AssertionError("system DNS must not be used in doh mode")
 
-    monkeypatch.setattr("app.newrelic.requests.post", should_not_be_called)
+    monkeypatch.setattr("app.newrelic.http.post", should_not_be_called)
     monkeypatch.setattr(
-        "app.newrelic.requests.get",
+        "app.newrelic.http.get",
         lambda url, params=None, headers=None, timeout=None: (
             resolved.append(url) or type("R", (), {
                 "json": lambda self=None: {
@@ -475,13 +482,13 @@ def test_doh_mode_skips_system_dns(monkeypatch):
 
 
 def test_system_mode_never_uses_doh(monkeypatch):
-    import requests as real_requests
+    from app import httpclient as real_requests
     monkeypatch.setattr(
         "app.newrelic.socket.getaddrinfo",
         lambda host, port, *a, **k: [(2, 1, 6, "", ("0.0.0.0", 443))],
     )
     monkeypatch.setattr(
-        "app.newrelic.requests.post",
+        "app.newrelic.http.post",
         lambda *a, **k: (_ for _ in ()).throw(
             real_requests.ConnectionError("refused")),
     )
@@ -489,14 +496,14 @@ def test_system_mode_never_uses_doh(monkeypatch):
     def should_not_be_called(*a, **k):
         raise AssertionError("system mode must not fall back to DoH")
 
-    monkeypatch.setattr("app.newrelic.requests.get", should_not_be_called)
+    monkeypatch.setattr("app.newrelic.http.get", should_not_be_called)
     client = NewRelicClient("K", dns_mode="system", logger=lambda m: None)
     assert client.send([Sample("up", 1, "h", {})]) is False
 
 
 def test_doh_provider_failover(monkeypatch):
     FakePool.created = []
-    import requests as real_requests
+    from app import httpclient as real_requests
     attempts = []
 
     monkeypatch.setattr(
@@ -504,7 +511,7 @@ def test_doh_provider_failover(monkeypatch):
         lambda host, port, *a, **k: [(2, 1, 6, "", ("0.0.0.0", 443))],
     )
     monkeypatch.setattr(
-        "app.newrelic.requests.post",
+        "app.newrelic.http.post",
         lambda *a, **k: (_ for _ in ()).throw(
             real_requests.ConnectionError("refused")),
     )
@@ -518,7 +525,7 @@ def test_doh_provider_failover(monkeypatch):
                 "Answer": [{"type": 1, "data": "8.8.4.4"}]}
         })()
 
-    monkeypatch.setattr("app.newrelic.requests.get", flaky_get)
+    monkeypatch.setattr("app.newrelic.http.get", flaky_get)
     monkeypatch.setattr("app.newrelic.urllib3.HTTPSConnectionPool", FakePool)
     client = NewRelicClient("K", dns_mode="auto")
     assert client.send([Sample("up", 1, "h", {})]) is True
@@ -527,18 +534,18 @@ def test_doh_provider_failover(monkeypatch):
 
 
 def test_all_doh_providers_blocked_reports_clearly(monkeypatch):
-    import requests as real_requests
+    from app import httpclient as real_requests
     monkeypatch.setattr(
         "app.newrelic.socket.getaddrinfo",
         lambda host, port, *a, **k: [(2, 1, 6, "", ("0.0.0.0", 443))],
     )
     monkeypatch.setattr(
-        "app.newrelic.requests.post",
+        "app.newrelic.http.post",
         lambda *a, **k: (_ for _ in ()).throw(
             real_requests.ConnectionError("refused")),
     )
     monkeypatch.setattr(
-        "app.newrelic.requests.get",
+        "app.newrelic.http.get",
         lambda *a, **k: (_ for _ in ()).throw(
             real_requests.ConnectionError("doh blocked")),
     )
@@ -552,18 +559,18 @@ def test_all_doh_providers_blocked_reports_clearly(monkeypatch):
 
 def test_doh_answers_that_are_themselves_blackholed_are_ignored(monkeypatch):
     """A blocker that answers DoH must not poison the pin."""
-    import requests as real_requests
+    from app import httpclient as real_requests
     monkeypatch.setattr(
         "app.newrelic.socket.getaddrinfo",
         lambda host, port, *a, **k: [(2, 1, 6, "", ("0.0.0.0", 443))],
     )
     monkeypatch.setattr(
-        "app.newrelic.requests.post",
+        "app.newrelic.http.post",
         lambda *a, **k: (_ for _ in ()).throw(
             real_requests.ConnectionError("refused")),
     )
     monkeypatch.setattr(
-        "app.newrelic.requests.get",
+        "app.newrelic.http.get",
         lambda url, params=None, headers=None, timeout=None: type("R", (), {
             "json": lambda self=None: {"Answer": [{"type": 1, "data": "0.0.0.0"}]}
         })(),

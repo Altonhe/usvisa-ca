@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Deque, Dict, List, Optional
 
-import requests
+from . import httpclient as http
 
 SIGN_IN_PATH = "/{locale}/niv/users/sign_in"
 BASE_URL = "https://ais.usvisa-info.com"
@@ -97,14 +97,14 @@ class NetworkGuard:
         locale: str = "en-ca",
         user_agent: str = "",
         logger: Optional[Callable[[str], None]] = None,
-        session: Optional[requests.Session] = None,
+        session: Optional[http.Session] = None,
     ) -> None:
         self.config = config
         self.locale = locale
         self.user_agent = user_agent
         self._log = logger or (lambda m: print(m, flush=True))
         # Used for the probe and the control API; never carries AIS cookies.
-        self._http = session or requests.Session()
+        self._http = session or http.Session()
         self._lock = threading.Lock()
         self._recovering = threading.Lock()
         # "vpn" when routing through config.proxy, "direct" after a fallback.
@@ -129,14 +129,15 @@ class NetworkGuard:
             return {"http": self.config.proxy, "https": self.config.proxy}
         return {}
 
-    def apply(self, session: requests.Session) -> None:
+    def apply(self, session: http.Session) -> None:
         """Point an AIS session at the current egress."""
         wanted = self.proxies()
         if session.proxies != wanted:
             session.proxies.clear()
             session.proxies.update(wanted)
-            # Pooled keep-alive connections still run over the old route.
-            session.close()
+            # No session.close() here: a closed curl_cffi session refuses every
+            # later request. libcurl keys connection reuse on the proxy, so the
+            # old route's keep-alive connections are not picked up again.
 
     def paused(self) -> bool:
         return time.monotonic() < self._paused_until
@@ -232,7 +233,7 @@ class NetworkGuard:
                 url, headers=headers, proxies=route,
                 timeout=self.config.timeout, allow_redirects=True,
             )
-        except requests.RequestException as exc:
+        except http.RequestException as exc:
             result = ProbeResult(BLOCKED, f"{type(exc).__name__}: {exc}")
         else:
             body = resp.text[:20000].lower() if resp.text else ""
@@ -351,7 +352,7 @@ class NetworkGuard:
             resp = self._http.request(
                 method, url, json=payload, timeout=self.config.timeout, proxies={},
             )
-        except requests.RequestException as exc:
+        except http.RequestException as exc:
             raise ProviderError(str(exc)) from None
         try:
             body = resp.json()

@@ -410,8 +410,7 @@ def test_network_error_still_counts_towards_the_alert_budget(tmp_path, monkeypat
 
 def test_get_page_retries_once_then_raises_transient(monkeypatch):
     """The retry is what absorbs the timeout before the worker ever sees it."""
-    import requests
-
+    from app import httpclient as requests
     from app.ais_client import AisClient, TransientNetworkError
 
     client = AisClient("a@example.com", "p", logger=lambda m: None)
@@ -430,8 +429,7 @@ def test_get_page_retries_once_then_raises_transient(monkeypatch):
 
 
 def test_get_page_succeeds_on_the_retry(monkeypatch):
-    import requests
-
+    from app import httpclient as requests
     from app.ais_client import AisClient
 
     client = AisClient("a@example.com", "p", logger=lambda m: None)
@@ -461,8 +459,7 @@ def test_get_page_succeeds_on_the_retry(monkeypatch):
 
 def test_http_errors_are_not_treated_as_transient(monkeypatch):
     """A 500 is a real problem; do not silently retry it as a blip."""
-    import requests
-
+    from app import httpclient as requests
     from app.ais_client import AisClient
 
     client = AisClient("a@example.com", "p", logger=lambda m: None)

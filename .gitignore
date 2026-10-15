@@ -175,3 +175,5 @@ local.py
 # Logs
 logs/
 *.log
+# Pre-migration config backups still hold plaintext credentials.
+config.yaml.*.bak

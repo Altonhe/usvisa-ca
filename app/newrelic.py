@@ -37,7 +37,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import certifi
-import requests
+from . import httpclient as http
 import urllib3
 
 from .metrics import Sample, to_newrelic
@@ -175,10 +175,10 @@ class NewRelicClient:
                 return result
 
         try:
-            resp = requests.post(
+            resp = http.post(
                 self.endpoint, data=body, headers=headers, timeout=self.timeout
             )
-        except requests.RequestException as exc:
+        except http.RequestException as exc:
             if self.dns_mode == "auto" and self._is_blackholed():
                 self._log(
                     f"new relic: {self.host} is blackholed by a DNS-level blocker; "
@@ -255,7 +255,7 @@ class NewRelicClient:
         """Resolve the endpoint over HTTPS and remember the address."""
         for provider in DOH_PROVIDERS:
             try:
-                resp = requests.get(
+                resp = http.get(
                     provider,
                     params={"name": self.host, "type": "A"},
                     headers={"accept": "application/dns-json"},

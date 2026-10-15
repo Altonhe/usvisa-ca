@@ -17,7 +17,7 @@ import html
 from datetime import date
 from typing import Callable, List, Optional
 
-import requests
+from . import httpclient as http
 
 from .config import TelegramConfig
 
@@ -47,7 +47,7 @@ class TelegramNotifier:
             return False
         url = f"{API_ROOT}/bot{self.config.bot_token}/sendMessage"
         try:
-            resp = requests.post(
+            resp = http.post(
                 url,
                 json={
                     "chat_id": self.config.chat_id,
@@ -57,7 +57,7 @@ class TelegramNotifier:
                 },
                 timeout=self.timeout,
             )
-        except requests.RequestException as exc:
+        except http.RequestException as exc:
             self._log(f"telegram send failed (ignored): {exc}")
             return False
         if resp.status_code != 200:
@@ -75,7 +75,7 @@ class TelegramNotifier:
             self._log("telegram not configured; notifications are off")
             return False
         try:
-            resp = requests.get(
+            resp = http.get(
                 f"{API_ROOT}/bot{self.config.bot_token}/getMe", timeout=self.timeout
             )
             data = resp.json()
