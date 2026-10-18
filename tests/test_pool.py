@@ -460,7 +460,7 @@ def test_visa_type_cascades_and_is_normalised(tmp_path):
     assert [a.visa_type for a in primary.applications] == ["B1/B2", "F1"]
     assert old.canary and old.applications[0].visa_type == "B1/B2"
     assert not old.auto_discover
-    assert cfg.account_cooldown == 300
+    assert cfg.account_cooldown == 30
     assert cfg.total_applications() == 2
 
 

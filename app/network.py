@@ -61,7 +61,7 @@ class NetworkConfig:
     # Seconds to wait for a switched profile to report "connected".
     switch_timeout: int = 60
     # Seconds the whole pool pauses when no egress works at all.
-    pause_on_ip_ban: int = 300
+    pause_on_ip_ban: int = 30
     # After a direct fallback, how often (seconds) to check whether the VPN
     # works again and move traffic back onto it.
     vpn_retry_interval: int = 300

@@ -49,7 +49,7 @@ max_consecutive_failures: 5
 # Retrying a blocked account every sweep only deepens the block; meanwhile
 # canaries and other accounts carry its calendars. When the rest is over it
 # gets one more try, and another rest if that fails too. 0 disables resting.
-account_cooldown: 300
+account_cooldown: 30
 
 # The site intermittently reports a schedule as completed/locked (or an
 # account as holding nothing actionable) when the response is really just a
@@ -167,7 +167,7 @@ network:
   # Seconds to wait for a switched profile to connect.
   switch_timeout: 60
   # Seconds the whole pool pauses when no egress works at all.
-  pause_on_ip_ban: 300
+  pause_on_ip_ban: 30
 
 # Where the app keeps its JSON store (store.json is created inside).
 data_dir: data

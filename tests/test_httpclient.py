@@ -94,3 +94,105 @@ def test_session_counts_site_replies(local_server):
     assert session.site_replies == 0
     session.get(url + "/x", timeout=5)
     assert session.site_replies == 1
+
+
+
+@pytest.fixture
+def flaky_server():
+    """Answers the first ``fails`` GETs with 403, then 200; records client ports."""
+    state = {"fails": 0, "ports": [], "posts": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _reply(self, code):
+            body = b"{}"
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            state["ports"].append(self.client_address[1])
+            if state["fails"] > 0:
+                state["fails"] -= 1
+                self._reply(403)
+            else:
+                self._reply(200)
+
+        def do_POST(self):  # noqa: N802
+            state["posts"] += 1
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            self._reply(403)
+
+        def log_message(self, *a):
+            pass
+
+    class Server(ThreadingHTTPServer):
+        daemon_threads = True
+
+    server = Server(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_port}", state
+    server.shutdown()
+    server.server_close()
+
+
+def test_refused_get_is_retried_on_a_fresh_connection(flaky_server):
+    url, state = flaky_server
+    state["fails"] = 2
+    session = http.Session()
+    try:
+        resp = session.get(url + "/days.json", timeout=5)
+    finally:
+        session.close()
+    assert resp.status_code == 200
+    assert session.retries == 2 and session.site_replies == 1
+    ports = state["ports"]
+    assert len(ports) == 3 and len(set(ports)) == 3, "each retry must reconnect"
+
+
+def test_three_refusals_return_the_last_reply(flaky_server):
+    url, state = flaky_server
+    state["fails"] = 10
+    session = http.Session()
+    try:
+        resp = session.get(url + "/days.json", timeout=5)
+    finally:
+        session.close()
+    assert resp.status_code == 403
+    assert len(state["ports"]) == http.DEFAULT_ATTEMPTS == 3
+    assert session.site_replies == 0
+
+
+def test_post_is_never_retried(flaky_server):
+    url, state = flaky_server
+    session = http.Session()
+    try:
+        resp = session.post(url + "/appointment", data={"a": "1"}, timeout=5)
+    finally:
+        session.close()
+    assert resp.status_code == 403 and state["posts"] == 1 and session.retries == 0
+
+
+def test_connect_failure_is_retried_then_raised():
+    session = http.Session()
+    try:
+        with pytest.raises(http.RequestException):
+            session.get("http://127.0.0.1:9/", timeout=2)
+    finally:
+        session.close()
+    assert session.retries == 2
+
+
+def test_retry_keeps_the_login_cookie(local_server):
+    url, seen = local_server
+    session = http.Session()
+    try:
+        session.get(url + "/x", timeout=5)          # sets _yatri_session
+        session.drop_connection()
+        session.get(url + "/y", timeout=5)
+    finally:
+        session.close()
+    assert "_yatri_session=abc" in seen[-1].get("Cookie", "")

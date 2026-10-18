@@ -334,7 +334,7 @@ class Config:
     # deepens the block; resting it lets the other accounts in the pool carry
     # its calendars meanwhile. After the rest it gets one more try, and another
     # rest if that fails too.
-    account_cooldown: int = 300
+    account_cooldown: int = 30
     # Discovery (the landing page plus one continue_actions page per
     # application) is all HTML, dwarfs days.json, and carries no availability.
     # What it reports changes at most once, so it is cached this many seconds
@@ -712,7 +712,7 @@ def load_config(path: Optional[Path] = None) -> Config:
         switch_timeout=max(1, _as_int(
             net_raw.get("switch_timeout"), 60, "network.switch_timeout")),
         pause_on_ip_ban=max(0, _as_int(
-            net_raw.get("pause_on_ip_ban"), 300, "network.pause_on_ip_ban")),
+            net_raw.get("pause_on_ip_ban"), 30, "network.pause_on_ip_ban")),
         vpn_retry_interval=max(1, _as_int(
             net_raw.get("vpn_retry_interval"), 300, "network.vpn_retry_interval")),
         timeout=max(1, _as_int(net_raw.get("timeout"), 15, "network.timeout")),
@@ -746,7 +746,7 @@ def load_config(path: Optional[Path] = None) -> Config:
             raw.get("max_consecutive_failures"), 5, "max_consecutive_failures"
         ),
         account_cooldown=max(0, _as_int(
-            raw.get("account_cooldown"), 300, "account_cooldown"
+            raw.get("account_cooldown"), 30, "account_cooldown"
         )),
         done_confirmations=_as_int(
             raw.get("done_confirmations"), 5, "done_confirmations"

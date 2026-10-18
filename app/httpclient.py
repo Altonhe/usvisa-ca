@@ -48,6 +48,15 @@ def site_replied(status: int) -> bool:
     return status < 500 and status not in (403, 407, 429)
 
 
+# Attempts per idempotent request before it counts as one failure. With a
+# rotating proxy pool every attempt runs on a fresh connection, i.e. (usually)
+# a fresh exit IP, so a refused address is retried from another one at once.
+DEFAULT_ATTEMPTS = 3
+
+# Only these are retried: replaying a POST could submit a booking twice.
+_RETRYABLE_METHODS = frozenset({"GET", "HEAD"})
+
+
 class Session(_curl.Session):
     """A curl_cffi session that impersonates Chrome unless told otherwise.
 
@@ -55,18 +64,56 @@ class Session(_curl.Session):
     The worker reads it to learn that the egress works from requests it made
     anyway, so a sweep that failed for account reasons (an expired session,
     a locked account) needs no extra egress probe.
+
+    GET/HEAD requests are tried up to ``attempts`` times. An attempt is
+    retried when it raised (connect failure, timeout, proxy error) or got a
+    reply that is not the application's (403/407/429/5xx). Each retry drops
+    this thread's libcurl handle first, so it opens a new connection and a
+    rotating proxy hands out a new exit IP instead of reusing the refused one
+    over keep-alive. The caller sees only the last outcome: the final
+    response, or the final exception.
     """
 
-    def __init__(self, **kwargs: Any) -> None:
+    def __init__(self, attempts: int = DEFAULT_ATTEMPTS, **kwargs: Any) -> None:
         kwargs.setdefault("impersonate", IMPERSONATE)
         super().__init__(**kwargs)
         self.site_replies = 0
+        self.attempts = max(1, int(attempts))
+        self.retries = 0  # retried attempts, for logs and tests
 
-    def request(self, *args: Any, **kwargs: Any) -> Response:  # type: ignore[override]
-        resp = super().request(*args, **kwargs)
-        if site_replied(resp.status_code):
-            self.site_replies += 1
-        return resp
+    def request(self, method: str, *args: Any, **kwargs: Any) -> Response:  # type: ignore[override]
+        tries = self.attempts if str(method).upper() in _RETRYABLE_METHODS else 1
+        for attempt in range(1, tries + 1):
+            if attempt > 1:
+                self.retries += 1
+                self.drop_connection()
+            try:
+                resp = super().request(method, *args, **kwargs)
+            except RequestException:
+                if attempt == tries:
+                    raise
+                continue
+            if site_replied(resp.status_code):
+                self.site_replies += 1
+                return resp
+            if attempt == tries:
+                return resp
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def drop_connection(self) -> None:
+        """Forget this thread's pooled connections; the next request reconnects.
+
+        curl_cffi keeps one libcurl handle per thread, and the handle owns the
+        connection cache. Closing it touches no other thread's requests, and
+        cookies live on the session, not the handle, so the login survives.
+        """
+        local = getattr(self, "_local", None)
+        curl = getattr(local, "curl", None) if local is not None else None
+        if curl is not None:
+            try:
+                curl.close()
+            finally:
+                local.curl = None
 
 
 def request(method: str, url: str, **kwargs: Any) -> Response:
