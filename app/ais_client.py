@@ -57,6 +57,12 @@ DATE_KEY = "appointments[consulate_appointment][date]"
 TIME_KEY = "appointments[consulate_appointment][time]"
 
 
+def _usable_time(value) -> bool:
+    """A real time-of-day string, not a missing one rendered as text."""
+    text = "" if value is None else str(value).strip()
+    return bool(text) and text.lower() not in ("none", "null")
+
+
 @dataclass
 class PrewarmedForm:
     """A booking form fetched and parsed ahead of a match.
@@ -710,8 +716,18 @@ class AisClient:
         if not isinstance(data, dict):
             self._log(f"unexpected times payload: {data!r}"[:160])
             return None
-        times = data.get("available_times") or data.get("business_times") or []
-        return [str(t) for t in times]
+        # The site can answer {"available_times": [null], ...} for a day that
+        # days.json still lists (the last slot just went). [None] is truthy,
+        # so without this filter it became the time "None" and was POSTed.
+        def clean(values) -> List[str]:
+            out = []
+            for t in values or []:
+                text = "" if t is None else str(t).strip()
+                if text and text.lower() not in ("none", "null"):
+                    out.append(text)
+            return out
+
+        return clean(data.get("available_times")) or clean(data.get("business_times"))
 
     # -- booking ---------------------------------------------------------
 
@@ -914,6 +930,9 @@ class AisClient:
                 return False
             self.remember_times(slot.schedule_id, slot.facility_id, times)
             slot.time = times[0]
+        if not _usable_time(slot.time):
+            self._log(f"refusing to book {slot}: no usable time slot ({slot.time!r})")
+            return False
         payload[TIME_KEY] = slot.time
 
         redacted = {k: v for k, v in payload.items() if k != "authenticity_token"}
@@ -996,6 +1015,9 @@ class AisClient:
                 self._log(f"no time slots left on {slot.day} at {slot.consulate}")
                 return False
             slot.time = times[0]
+        if not _usable_time(slot.time):
+            self._log(f"refusing to book {slot}: no usable time slot ({slot.time!r})")
+            return False
         payload[TIME_KEY] = slot.time
         payload.setdefault("commit", "Submit")
         payload.update(self._solve_captcha(page, form.action))

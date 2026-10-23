@@ -360,3 +360,18 @@ def test_watched_consulates_covers_applications_and_groups(tmp_path):
     found = w._watched_consulates()
     assert set(found) == {TRT, VAN, 91}
     assert len(found) == len(set(found)), "must not repeat a facility"
+
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ({"available_times": [None], "business_times": [None]}, []),
+    ({"available_times": ["None", "null", ""], "business_times": []}, []),
+    ({"available_times": [None, "08:15"], "business_times": []}, ["08:15"]),
+    ({"available_times": [], "business_times": ["09:00"]}, ["09:00"]),
+])
+def test_null_time_slots_are_not_times(monkeypatch, payload, expected):
+    """times.json answering [null] must read as 'no slot', never as 'None'."""
+    from app.ais_client import AisClient
+    c = AisClient("a@e.com", "x")
+    monkeypatch.setattr(c, "_get_json", lambda url, referer="": payload)
+    assert c.get_available_times("1", 95, __import__("datetime").date(2027, 2, 22)) == expected
