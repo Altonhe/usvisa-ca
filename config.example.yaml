@@ -136,6 +136,12 @@ active_hours: []
 booking_retry_attempts: 3
 booking_retry_delay: 2
 
+# Global cap on AIS requests per second, across every account (they share one
+# egress). Polling, discovery, prewarm and every retry wait for a slot, so a
+# failing request is retried at most this fast. Once a bookable day is seen,
+# the confirm / times.json / booking requests skip the queue. 0 = no limit.
+max_requests_per_second: 1
+
 # --- Network egress ---------------------------------------------------------
 # Two kinds of block need opposite fixes:
 #   account ban -> one account is refused while others get through. That

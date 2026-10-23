@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+from . import httpclient as http
 from .ais_client import (AisClient, AisError, LoginFailed, Schedule,
                          SessionExpired, Slot, TransientNetworkError,
                          parse_site_date)
@@ -817,7 +818,8 @@ class Worker:
         source = self._borrowed.pop((schedule_id, facility_id), None)
         if source is None:
             return days
-        own = client.get_available_days(schedule_id, facility_id)
+        with http.urgent():  # a hit: race for the slot, skip the rate limit
+            own = client.get_available_days(schedule_id, facility_id)
         if own is None:
             self.log(
                 f"    {consulate_name(facility_id):<12} hit via {source}, but "
@@ -1373,7 +1375,8 @@ class Worker:
         for member in members:
             if self._stop.is_set():
                 return
-            times = client.get_available_times(member, facility_id, day)
+            with http.urgent():
+                times = client.get_available_times(member, facility_id, day)
             per_member_times[member] = times or []
 
         total_slots = sum(len(t) for t in per_member_times.values())
@@ -1618,6 +1621,28 @@ class Worker:
             return min(candidates, key=lambda s: (s.day, order.index(s.facility_id)))
         return candidates[0]
 
+    def _book(self, client: AisClient, app: Application, slot: Slot) -> bool:
+        warmed = client.peek_prewarmed(
+            app.schedule_id, self.config.booking_prewarm_ttl
+        ) if hasattr(client, "peek_prewarmed") else None
+
+        if warmed is not None:
+            # The appointment page, its hidden fields and its CSRF token
+            # were already fetched and parsed, so the only round trips left
+            # are times.json and the POST itself. On a live site that
+            # difference is most of the window in which somebody else takes
+            # the slot.
+            return client.book_prewarmed(
+                slot, warmed, dry_run=self.config.test_mode,
+                speculative=self.config.speculative_booking,
+            )
+        return client.book(
+            slot,
+            dry_run=self.config.test_mode,
+            retry_attempts=self.config.booking_retry_attempts,
+            retry_delay=self.config.booking_retry_delay,
+        )
+
     def _attempt_booking(
         self, account: Account, client: AisClient, app: Application, slot: Slot,
         schedule: Optional[Schedule] = None,
@@ -1641,27 +1666,8 @@ class Worker:
         # between the match and the booking request itself. The Telegram
         # message still reports what was attempted, just a moment later.
         try:
-            warmed = client.peek_prewarmed(
-                app.schedule_id, self.config.booking_prewarm_ttl
-            ) if hasattr(client, "peek_prewarmed") else None
-
-            if warmed is not None:
-                # The appointment page, its hidden fields and its CSRF token
-                # were already fetched and parsed, so the only round trips left
-                # are times.json and the POST itself. On a live site that
-                # difference is most of the window in which somebody else takes
-                # the slot.
-                ok = client.book_prewarmed(
-                    slot, warmed, dry_run=self.config.test_mode,
-                    speculative=self.config.speculative_booking,
-                )
-            else:
-                ok = client.book(
-                    slot,
-                    dry_run=self.config.test_mode,
-                    retry_attempts=self.config.booking_retry_attempts,
-                    retry_delay=self.config.booking_retry_delay,
-                )
+            with http.urgent():  # booking races other people: no rate limit
+                ok = self._book(client, app, slot)
         except AisError as exc:
             self.log(f"[{account.name}] booking failed: {exc}")
             self.store.update_application(

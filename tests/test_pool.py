@@ -500,3 +500,12 @@ def test_dashboard_shows_which_canaries_each_applicant_uses(tmp_path):
     assert row["schedule_id"] == "111" and row["state"] == "matched"
     assert row["canaries"] == ["C1", "C2"], "C3 returned another ETag"
     assert row["answered_by"] in {"C1", "C2"}
+
+
+
+def test_max_requests_per_second_defaults_to_one_and_accepts_fractions(tmp_path):
+    assert load_config(write(tmp_path, CFG)).max_requests_per_second == 1.0
+    cfg = load_config(write(tmp_path, "max_requests_per_second: 0.5\n" + CFG))
+    assert cfg.max_requests_per_second == 0.5
+    with pytest.raises(ConfigError, match="max_requests_per_second"):
+        load_config(write(tmp_path, "max_requests_per_second: -1\n" + CFG))

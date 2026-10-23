@@ -21,7 +21,10 @@ Differences from ``requests`` that callers must respect:
 
 from __future__ import annotations
 
-from typing import Any
+import contextlib
+import threading
+import time
+from typing import Any, Iterator
 
 from curl_cffi import requests as _curl
 from curl_cffi.requests import Response  # noqa: F401 - re-exported
@@ -46,6 +49,59 @@ def site_replied(status: int) -> bool:
     (maintenance is told apart by the network guard's own probe).
     """
     return status < 500 and status not in (403, 407, 429)
+
+
+class RateLimiter:
+    """Process-wide cap on AIS requests per second, shared by every account.
+
+    Every account leaves through the same egress, so the site sees their
+    combined rate: the cap is global, not per session. Each caller reserves
+    the next free slot under a short lock and sleeps outside it, so parallel
+    pollers queue up one ``1/rate`` apart instead of firing together. Retries
+    take a slot too, which is what spaces them out.
+
+    Requests made inside :func:`urgent` skip the queue: once a bookable day
+    is seen, the confirm, times.json and booking requests race other people
+    for the slot. ``rate <= 0`` turns the limiter off (the default, so tests
+    and one-off scripts are not slowed down; ``main`` sets the configured rate).
+    """
+
+    def __init__(self, rate: float = 0.0) -> None:
+        self._lock = threading.Lock()
+        self._next = 0.0
+        self.rate = 0.0
+        self.configure(rate)
+
+    def configure(self, rate: float) -> None:
+        self.rate = max(0.0, float(rate))
+
+    def acquire(self) -> float:
+        """Wait for this request's slot; returns the seconds waited."""
+        if self.rate <= 0 or getattr(_urgent, "depth", 0) > 0:
+            return 0.0
+        interval = 1.0 / self.rate
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._next)
+            self._next = start + interval
+        wait = start - now
+        if wait > 0:
+            time.sleep(wait)
+        return wait
+
+
+_urgent = threading.local()
+limiter = RateLimiter()
+
+
+@contextlib.contextmanager
+def urgent() -> Iterator[None]:
+    """Requests on this thread inside the block bypass the rate limit."""
+    _urgent.depth = getattr(_urgent, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        _urgent.depth -= 1
 
 
 # Attempts per idempotent request before it counts as one failure. With a
@@ -87,6 +143,7 @@ class Session(_curl.Session):
             if attempt > 1:
                 self.retries += 1
                 self.drop_connection()
+            limiter.acquire()
             try:
                 resp = super().request(method, *args, **kwargs)
             except RequestException:

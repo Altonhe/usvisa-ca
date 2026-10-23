@@ -15,6 +15,7 @@ from typing import List, Optional
 
 import uvicorn
 
+from . import httpclient as http
 from .config import Config, ConfigError, load_config
 from .dashboard import create_app
 from .metrics import collect
@@ -227,6 +228,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if config.network.provider_enabled:
         _print(f"network: OpenVPN provider at {config.network.openvpn_provider_url}")
     worker = Worker(config, store, notifier, newrelic=newrelic, network=network)
+    http.limiter.configure(config.max_requests_per_second)
+    if config.max_requests_per_second > 0:
+        _print(
+            f"rate limit: at most {config.max_requests_per_second:g} AIS "
+            "request(s)/s while polling; booking after a hit is exempt"
+        )
 
     if args.once:
         _print("\nrunning a single sweep\n")

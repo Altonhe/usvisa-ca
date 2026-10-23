@@ -164,6 +164,20 @@ def _as_int(value: Any, default: int, label: str = "") -> int:
         raise ConfigError(f"{label or 'value'}: {value!r} is not an integer") from exc
 
 
+def _as_rate(value: Any, default: float, label: str = "") -> float:
+    """A non-negative requests-per-second figure; 0 disables the cap."""
+    if value is None or value == "":
+        return default
+    try:
+        rate = float(str(value).strip())
+    except ValueError as exc:
+        raise ConfigError(f"{label or 'value'}: {value!r} is not a number") from exc
+    if rate < 0 or rate != rate:
+        raise ConfigError(f"{label or 'value'}: {value!r} must be >= 0")
+    return rate
+
+
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -382,6 +396,10 @@ class Config:
     # giving up until the next full poll_interval.
     booking_retry_attempts: int = 3
     booking_retry_delay: float = 2.0
+    # Global cap on AIS requests per second across every account (they share
+    # one egress). Retries count against it, so they are spaced out too. The
+    # confirm / times.json / booking requests after a hit are exempt. 0 = off.
+    max_requests_per_second: float = 1.0
     data_dir: Path = Path("data")
     locale: str = "en-ca"
     user_agent: str = (
@@ -776,6 +794,9 @@ def load_config(path: Optional[Path] = None) -> Config:
         ),
         booking_retry_delay=float(
             _as_int(raw.get("booking_retry_delay"), 2, "booking_retry_delay")
+        ),
+        max_requests_per_second=_as_rate(
+            raw.get("max_requests_per_second"), 1.0, "max_requests_per_second"
         ),
         data_dir=Path(str(raw.get("data_dir") or "data")),
         locale=str(raw.get("locale") or "en-ca"),

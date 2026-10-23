@@ -196,3 +196,52 @@ def test_retry_keeps_the_login_cookie(local_server):
     finally:
         session.close()
     assert "_yatri_session=abc" in seen[-1].get("Cookie", "")
+
+
+
+# -- rate limit ------------------------------------------------------------
+
+def test_rate_limiter_spaces_requests_across_threads():
+    limiter = http.RateLimiter(rate=20)  # one slot every 50 ms
+    stamps = []
+    lock = threading.Lock()
+
+    def worker():
+        limiter.acquire()
+        with lock:
+            stamps.append(__import__("time").monotonic())
+
+    threads = [threading.Thread(target=worker) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    stamps.sort()
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    assert min(gaps) >= 0.04, gaps
+
+
+def test_urgent_requests_skip_the_rate_limit():
+    limiter = http.RateLimiter(rate=1)
+    limiter.acquire()  # takes the current slot
+    with http.urgent():
+        assert limiter.acquire() == 0.0  # would otherwise wait ~1 s
+    assert getattr(http._urgent, "depth", 0) == 0
+
+
+def test_rate_limit_zero_is_off():
+    limiter = http.RateLimiter(rate=0)
+    assert all(limiter.acquire() == 0.0 for _ in range(50))
+
+
+def test_retries_go_through_the_rate_limit(flaky_server, monkeypatch):
+    url, state = flaky_server
+    state["fails"] = 2
+    calls = []
+    monkeypatch.setattr(http.limiter, "acquire", lambda: calls.append(1) or 0.0)
+    s = http.Session(attempts=3)
+    try:
+        assert s.get(url + "/days.json", timeout=5).status_code == 200
+    finally:
+        s.close()
+    assert len(calls) == 3, "every attempt, retries included, takes a slot"
