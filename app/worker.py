@@ -939,10 +939,15 @@ class Worker:
             return
 
         # cause == "ip"
+        what = (
+            "the egress cannot be reached"
+            if probe is not None and probe.unreachable
+            else "the egress IP is refused by the site"
+        )
         self.log(
-            f"network: the egress IP is refused by the site ({detail}). "
-            f"{names} failed because of the address, not the accounts; "
-            "rotating the egress instead of resting them"
+            f"network: {what} ({detail}). "
+            f"{names} failed because of the egress, not the accounts; "
+            "switching the egress instead of resting them"
         )
         for account, _, _ in incidents:
             self.store.set_account_error(account.name, "egress IP blocked")
@@ -962,7 +967,7 @@ class Worker:
             )
         self.log(f"network: {outcome}")
         self.notifier.account_error(
-            "all accounts", f"Egress IP blocked ({detail}). {outcome}"
+            "all accounts", f"{what[0].upper()}{what[1:]} ({detail}). {outcome}"
         )
 
     def _handle_sweep_exception(self, account: Account, exc: Exception) -> None:

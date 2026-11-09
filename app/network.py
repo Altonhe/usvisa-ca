@@ -77,6 +77,9 @@ class NetworkConfig:
 class ProbeResult:
     verdict: str
     detail: str = ""
+    # True when no HTTP reply came back at all (proxy handshake failed,
+    # connection refused/reset, timeout) rather than a refusing status code.
+    unreachable: bool = False
     at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
     @property
@@ -241,7 +244,7 @@ class NetworkGuard:
             if resp.status_code == 503:
                 resp = self._http.get(url, allow_redirects=True, **kwargs)
         except http.RequestException as exc:
-            result = ProbeResult(BLOCKED, f"{type(exc).__name__}: {exc}")
+            result = ProbeResult(BLOCKED, f"{type(exc).__name__}: {exc}", unreachable=True)
         else:
             body = (resp.text or "").lower()
             if resp.status_code == 503 and "maintenance" in body:
@@ -254,11 +257,20 @@ class NetworkGuard:
         return result
 
     def classify_failed_sweep(self) -> str:
-        """Why did every account fail? ``account``, ``ip`` or ``maintenance``."""
-        if not self.config.ip_ban_detection:
+        """Why did every account fail? ``account``, ``ip`` or ``maintenance``.
+
+        With ``ip_ban_detection`` off, a refusing status code is still put on
+        the accounts, but a proxy that cannot be reached at all is not: no
+        account can fix a dead proxy, so it goes to recovery (rotation, then
+        the direct fallback) like an IP ban would.
+        """
+        via_proxy = self._mode == "vpn" and bool(self.config.proxy)
+        if not self.config.ip_ban_detection and not via_proxy:
             return "account"
         result = self.probe()
         verdict = {OK: "account", BLOCKED: "ip", MAINTENANCE: "maintenance"}[result.verdict]
+        if not self.config.ip_ban_detection and not result.unreachable:
+            verdict = "account"
         self.last_verdict = verdict
         self._record("probe", verdict=verdict, detail=result.detail, mode=self._mode)
         return verdict

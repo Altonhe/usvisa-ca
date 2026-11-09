@@ -6,9 +6,18 @@ form.  All seven were read directly from the live ``<select>`` on
 ``/en-ca/niv/schedule/{id}/appointment`` and are confirmed correct.
 """
 
+import zoneinfo
 from datetime import datetime
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 from zoneinfo import ZoneInfo
+
+# Read zones only from the pinned ``tzdata`` package (see pyproject.toml), never
+# from the host's /usr/share/zoneinfo. zoneinfo prefers the system database
+# when one exists, so a Docker base image with an older Debian tzdata would
+# otherwise silently disagree with Windows/dev runs -- e.g. on BC's move to
+# permanent UTC-7 from November 2026. Upgrading the tzdata package is then the
+# one way to pick up a rule change, everywhere at once.
+zoneinfo.reset_tzpath(to=[])
 
 # facility_id -> canonical display name (as labelled by the site)
 FACILITIES: Dict[int, str] = {
@@ -39,7 +48,7 @@ TIMEZONES: Dict[int, str] = {
     92: "America/Toronto",      # Ottawa -- Eastern
     93: "America/Toronto",      # Quebec City -- Eastern
     94: "America/Toronto",      # Eastern
-    95: "America/Vancouver",    # Pacific
+    95: "America/Vancouver",    # Pacific; permanent UTC-7 from 2026-11-01
 }
 
 # Kept for backwards compatibility with older configs / scripts that did
@@ -125,16 +134,16 @@ def consulate_timezone(facility_id: int) -> str:
     return TIMEZONES.get(facility_id, "America/Toronto")
 
 
-def consulate_now(facility_id: int) -> datetime:
-    """Current local time at the consulate.
+def consulate_now(facility_id: int, at: Optional[datetime] = None) -> datetime:
+    """Local time at the consulate, now or at the aware instant ``at``.
 
-    ``zoneinfo`` needs a tz database, which neither Windows nor a slim Docker
-    image provides on its own -- hence the ``tzdata`` dependency. If the lookup
-    somehow still fails, this degrades to process-local time rather than
-    breaking the caller.
+    Zones come from the ``tzdata`` package only (see ``reset_tzpath`` above).
+    If the lookup somehow still fails, this degrades to process-local time
+    rather than breaking the caller.
     """
     try:
-        return datetime.now(ZoneInfo(consulate_timezone(facility_id)))
+        tz = ZoneInfo(consulate_timezone(facility_id))
+        return at.astimezone(tz) if at is not None else datetime.now(tz)
     except Exception:  # noqa: BLE001 - never worth failing a sweep over
         return datetime.now()
 

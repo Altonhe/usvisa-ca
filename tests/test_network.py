@@ -543,3 +543,47 @@ def test_a_site_reply_clears_the_egress_without_a_probe(tmp_path):
     assert g.classified == 0, "the site answered, so the egress is proven"
     assert g.recovered == 0
     assert w._failures["A"] == 1 and w._failures["B"] == 1, "charged to the accounts"
+
+
+# ---------------------------------------------------------------------------
+# A dead proxy falls back to the direct connection
+# ---------------------------------------------------------------------------
+
+class DeadProxyNet(FakeNet):
+    """The proxy fails the SOCKS handshake; the host's own address works."""
+
+    def get(self, url, headers=None, proxies=None, timeout=None, allow_redirects=True):
+        if proxies:
+            self.probes.append(dict(proxies))
+            raise requests.ConnectionError(
+                "curl: (97) Failed to receive SOCKS response, proxy closed connection")
+        return super().get(url, headers, proxies, timeout, allow_redirects)
+
+
+def test_unreachable_proxy_is_an_egress_fault_even_without_ban_detection():
+    g = guard(DeadProxyNet(direct_ok=True), openvpn_provider_url="",
+              ip_ban_detection=False, direct_fallback=True)
+    assert g.classify_failed_sweep() == "ip"
+    assert g.recover() is True
+    assert g.mode == "direct" and g.proxies() == {}
+
+
+def test_refusing_status_stays_on_the_accounts_without_ban_detection():
+    g = guard(FakeNet(site=Resp(403, "Forbidden")), openvpn_provider_url="",
+              ip_ban_detection=False, direct_fallback=True)
+    assert g.classify_failed_sweep() == "account"
+
+
+def test_direct_route_without_ban_detection_sends_no_probe():
+    net = FakeNet(direct_ok=True)
+    g = guard(net, proxy="", openvpn_provider_url="", ip_ban_detection=False)
+    assert g.classify_failed_sweep() == "account"
+    assert net.probes == []
+
+
+def test_dead_proxy_without_fallback_pauses_instead():
+    g = guard(DeadProxyNet(direct_ok=True), openvpn_provider_url="",
+              ip_ban_detection=False, direct_fallback=False)
+    assert g.classify_failed_sweep() == "ip"
+    assert g.recover() is False
+    assert g.paused() and g.mode == "vpn"

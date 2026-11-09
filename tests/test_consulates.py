@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import pytest
 
 from app.consulates import (FACILITIES, UnknownConsulate, consulate_name,
@@ -99,12 +101,31 @@ def test_the_three_canadian_offsets_are_distinct():
     assert halifax.utcoffset() > toronto.utcoffset()
 
 
-def test_vancouver_is_three_hours_behind_toronto():
-    """The concrete case that makes a single container TZ wrong."""
+@pytest.mark.parametrize("instant, hours", [
+    ("2026-01-15T17:00:00+00:00", 3),   # PST vs EST
+    ("2026-07-15T17:00:00+00:00", 3),   # PDT vs EDT
+    ("2026-11-09T17:00:00+00:00", 2),   # BC stays on UTC-7; Ontario back on EST
+    ("2027-07-15T17:00:00+00:00", 3),   # UTC-7 vs EDT
+])
+def test_vancouver_offset_from_toronto(instant, hours):
+    """The concrete case that makes a single container TZ wrong.
+
+    BC moved to permanent UTC-7 on 2026-11-01, so the gap is 3h in summer and
+    2h in winter from then on.
+    """
     from app.consulates import consulate_now
 
-    delta = consulate_now(94).utcoffset() - consulate_now(95).utcoffset()
-    assert delta.total_seconds() == 3 * 3600
+    at = datetime.fromisoformat(instant)
+    delta = consulate_now(94, at).utcoffset() - consulate_now(95, at).utcoffset()
+    assert delta.total_seconds() == hours * 3600
+
+
+def test_zones_come_from_the_pinned_tzdata_package():
+    import zoneinfo
+
+    import app.consulates  # noqa: F401 - import applies the TZPATH reset
+
+    assert zoneinfo.TZPATH == ()
 
 
 def test_eastern_posts_share_one_zone():
