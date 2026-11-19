@@ -443,7 +443,7 @@
       {% if network.provider_enabled %}
         <span class="pill {{ network.provider.status | default('offline') }}">{{ network.provider.status | default('offline') }}</span>
       {% endif %}
-      <span class="sub">routing via <code>{{ network.mode }}</code>{% if network.proxy %} &middot; <code>{{ network.proxy }}</code>{% endif %}</span>
+      <span class="sub">routing via <code>{{ network.mode }}</code>{% if network.proxy %} &middot; <code>{{ network.proxy }}</code>{% endif %}{% if network.gateway %} &middot; gateway <code>{{ network.gateway }}</code>{% endif %}</span>
       {% if network.last_verdict %}
         <span class="pill {{ network.last_verdict }}">last failed sweep: {{ network.last_verdict }} ban{% if network.last_verdict == 'maintenance' %}/maintenance{% endif %}</span>
       {% endif %}

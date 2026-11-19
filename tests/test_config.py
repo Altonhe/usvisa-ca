@@ -89,7 +89,7 @@ def test_env_interpolation(tmp_path, monkeypatch):
     monkeypatch.setenv("MY_PASS", "envsecret")
     monkeypatch.delenv("MISSING_TOKEN", raising=False)
     text = """
-capsolver_api_key: ${MISSING_TOKEN:-}
+capsolver: {enabled: false}
 accounts:
   - name: Env
     email: ${MY_EMAIL}

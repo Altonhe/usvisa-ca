@@ -287,7 +287,7 @@ class AisClient:
         payload, _etag, _fresh = self._get_json_meta(url, referer=referer)
         return payload
 
-    def _get_json_meta(self, url: str, referer: str = ""):
+    def _get_json_meta(self, url: str, referer: str = "", poll: bool = False):
         """GET a JSON endpoint, reporting the server's ETag alongside the body.
 
         Returns ``(payload, etag, from_cache)``. ``payload`` is ``None`` only
@@ -317,11 +317,20 @@ class AisClient:
         if cached:
             headers["If-None-Match"] = cached[0]
 
+        fallbacks = getattr(self.session, "gateway_fallbacks", 0)
         try:
-            resp = self.session.get(url, headers=headers, timeout=self.timeout)
+            if poll and getattr(self.session, "poll_gateway", None) is not None:
+                resp = self.session.get(url, headers=headers, timeout=self.timeout, poll=True)
+            else:
+                resp = self.session.get(url, headers=headers, timeout=self.timeout)
         except http.RequestException as exc:
             self._log(f"request failed: {exc}")
             return None, None, False
+        if getattr(self.session, "gateway_fallbacks", 0) != fallbacks:
+            self._log(
+                f"gateway could not poll ({self.session.last_gateway_failure}); "
+                "used the direct route instead"
+            )
 
         if resp.status_code == 304:
             if cached:
@@ -686,6 +695,7 @@ class AisClient:
         data, etag, _from_cache = self._get_json_meta(
             self.days_url(schedule_id, facility_id),
             referer=self.appointment_url(schedule_id),
+            poll=True,
         )
         if data is None:
             return None, None

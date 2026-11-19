@@ -30,7 +30,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from . import httpclient as http
 
@@ -52,6 +52,10 @@ class NetworkConfig:
     # Proxy every AIS request goes through, e.g. socks5h://openvpn-socks:1080.
     # Empty means direct.
     proxy: str = ""
+    # HTTP relay gateway (app/gateway.py) for availability polls only; sign-in,
+    # discovery and booking keep the proxy/direct route above.
+    gateway_url: str = ""
+    gateway_key: str = field(default="", repr=False)
     # Probe the egress when a whole sweep fails, so an IP ban is not mistaken
     # for every account being banned at once.
     ip_ban_detection: bool = True
@@ -71,6 +75,22 @@ class NetworkConfig:
     @property
     def provider_enabled(self) -> bool:
         return bool(self.openvpn_provider_url)
+
+    @property
+    def gateway(self) -> Optional[http.Gateway]:
+        if not self.gateway_url:
+            return None
+        return http.Gateway(self.gateway_url, self.gateway_key)
+
+    @property
+    def has_egress(self) -> bool:
+        """Is there a route other than the host's own address?"""
+        return bool(self.proxy)
+
+
+# (proxies mapping, gateway) -- how one request leaves the host.
+Route = Tuple[Dict[str, str], Optional[http.Gateway]]
+DIRECT: Route = ({}, None)
 
 
 @dataclass
@@ -111,7 +131,7 @@ class NetworkGuard:
         self._lock = threading.Lock()
         self._recovering = threading.Lock()
         # "vpn" when routing through config.proxy, "direct" after a fallback.
-        self._mode = "vpn" if config.proxy else "direct"
+        self._mode = "vpn" if config.has_egress else "direct"
         self._paused_until = 0.0
         # Monotonic time of the next "is the VPN back?" check while direct.
         self._next_vpn_retry = 0.0
@@ -132,8 +152,18 @@ class NetworkGuard:
             return {"http": self.config.proxy, "https": self.config.proxy}
         return {}
 
+    def _egress(self) -> Route:
+        """The configured egress, whatever the current mode."""
+        proxies = (
+            {"http": self.config.proxy, "https": self.config.proxy}
+            if self.config.proxy else {}
+        )
+        return proxies, None
+
     def apply(self, session: http.Session) -> None:
-        """Point an AIS session at the current egress."""
+        """Point an AIS session at the current egress (and the poll relay)."""
+        if hasattr(session, "poll_gateway"):
+            session.poll_gateway = self.config.gateway
         wanted = self.proxies()
         if session.proxies != wanted:
             session.proxies.clear()
@@ -186,7 +216,7 @@ class NetworkGuard:
         is stepped to the next profile and that is probed. Returns True when
         traffic was moved back onto the VPN.
         """
-        if self._mode != "direct" or not self.config.proxy:
+        if self._mode != "direct" or not self.config.has_egress:
             return False
         now = time.monotonic()
         if now < self._next_vpn_retry:
@@ -195,8 +225,7 @@ class NetworkGuard:
         if not self._recovering.acquire(blocking=False):
             return False
         try:
-            vpn = {"http": self.config.proxy, "https": self.config.proxy}
-            result = self.probe(proxies=vpn)
+            result = self.probe(route=self._egress())
             if not result.ok and self.config.provider_enabled:
                 # _rotate sets the mode back to "vpn" on success.
                 if not self._rotate(should_stop, limit=1):
@@ -213,9 +242,9 @@ class NetworkGuard:
 
     def _try_direct(self) -> bool:
         """Switch to the host's own address if allowed and the site takes it."""
-        if not (self.config.direct_fallback and self._mode == "vpn" and self.config.proxy):
+        if not (self.config.direct_fallback and self._mode == "vpn" and self.config.has_egress):
             return False
-        result = self.probe(proxies={})
+        result = self.probe(route=DIRECT)
         if not result.ok:
             return False
         self._mode = "direct"
@@ -226,7 +255,7 @@ class NetworkGuard:
 
     # -- probing -----------------------------------------------------------
 
-    def probe(self, proxies: Optional[Dict[str, str]] = None) -> ProbeResult:
+    def probe(self, route: Optional[Route] = None) -> ProbeResult:
         """One unauthenticated HEAD of the sign-in page through an egress.
 
         HEAD runs through the same nginx/WAF and Rails route as a GET, so a
@@ -237,8 +266,10 @@ class NetworkGuard:
         """
         url = BASE_URL + SIGN_IN_PATH.format(locale=self.locale)
         headers = {"User-Agent": self.user_agent} if self.user_agent else {}
-        route = self.proxies() if proxies is None else proxies
-        kwargs = dict(headers=headers, proxies=route, timeout=self.config.timeout)
+        proxies, gateway = (self.proxies(), None) if route is None else route
+        kwargs: Dict[str, Any] = dict(headers=headers, proxies=proxies, timeout=self.config.timeout)
+        if gateway is not None:
+            kwargs["gateway"] = gateway
         try:
             resp = self._http.head(url, allow_redirects=True, **kwargs)
             if resp.status_code == 503:
@@ -264,8 +295,8 @@ class NetworkGuard:
         account can fix a dead proxy, so it goes to recovery (rotation, then
         the direct fallback) like an IP ban would.
         """
-        via_proxy = self._mode == "vpn" and bool(self.config.proxy)
-        if not self.config.ip_ban_detection and not via_proxy:
+        via_egress = self._mode == "vpn" and self.config.has_egress
+        if not self.config.ip_ban_detection and not via_egress:
             return "account"
         result = self.probe()
         verdict = {OK: "account", BLOCKED: "ip", MAINTENANCE: "maintenance"}[result.verdict]
@@ -295,7 +326,7 @@ class NetworkGuard:
             if self.config.direct_fallback and self._mode == "vpn":
                 if self._try_direct():
                     return True
-            elif self._mode == "direct" and self.config.proxy:
+            elif self._mode == "direct" and self.config.has_egress:
                 # A previous fallback put us on the host IP, which is now
                 # refused too: going back to the VPN is the only way out.
                 self._mode = "vpn"
@@ -339,7 +370,7 @@ class NetworkGuard:
             if state != "connected":
                 self._record("connect-failed", profile=profile, detail=state)
                 continue
-            result = self.probe(proxies={"http": self.config.proxy, "https": self.config.proxy})
+            result = self.probe(route=({"http": self.config.proxy, "https": self.config.proxy}, None))
             if result.ok:
                 self._mode = "vpn"
                 self._log(f"network: {profile} is accepted by the site")
@@ -403,8 +434,8 @@ class NetworkGuard:
     def egress_ip(self) -> Dict[str, Any]:
         """The public address AIS traffic currently leaves from."""
         try:
-            resp = self._http.get(EGRESS_IP_URL, proxies=self.proxies(),
-                                  timeout=self.config.timeout)
+            kwargs: Dict[str, Any] = dict(proxies=self.proxies(), timeout=self.config.timeout)
+            resp = self._http.get(EGRESS_IP_URL, **kwargs)
             resp.raise_for_status()
             return {"ok": True, "ip": resp.json().get("ip"), "mode": self._mode}
         except Exception as exc:  # noqa: BLE001 - surfaced to the dashboard
@@ -434,6 +465,7 @@ class NetworkGuard:
             "enabled": True,
             "mode": self._mode,
             "proxy": self.config.proxy,
+            "gateway": self.config.gateway_url,
             "provider_enabled": self.config.provider_enabled,
             "provider": provider,
             "profiles": profiles,

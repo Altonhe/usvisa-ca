@@ -225,6 +225,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     if config.network.proxy:
         _print(f"network: AIS traffic goes through {config.network.proxy}")
+    if config.network.gateway_url:
+        _print(f"network: days.json polls are relayed by the gateway at {config.network.gateway_url}")
     if config.network.provider_enabled:
         _print(f"network: OpenVPN provider at {config.network.openvpn_provider_url}")
     worker = Worker(config, store, notifier, newrelic=newrelic, network=network)

@@ -24,7 +24,7 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
 from curl_cffi import requests as _curl
 from curl_cffi.requests import Response  # noqa: F401 - re-exported
@@ -35,6 +35,9 @@ from curl_cffi.requests.exceptions import (  # noqa: F401 - re-exported
     RequestException,
     Timeout,
 )
+
+from . import gateway as _gateway
+from .gateway import Gateway  # noqa: F401 - re-exported
 
 # "chrome" tracks the newest Chrome fingerprint the installed curl_cffi ships.
 IMPERSONATE = "chrome"
@@ -136,8 +139,54 @@ class Session(_curl.Session):
         self.site_replies = 0
         self.attempts = max(1, int(attempts))
         self.retries = 0  # retried attempts, for logs and tests
+        # Relay for availability polls only (``poll=True`` requests, see
+        # app/gateway.py). Sign-in, discovery and booking keep the session's
+        # own route; a poll the relay cannot answer falls back to it.
+        self.poll_gateway: Optional[_gateway.Gateway] = None
+        self.gateway_fallbacks = 0
+        self.last_gateway_failure = ""
+
+    def _send(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        return super().request(method, *args, **kwargs)
 
     def request(self, method: str, *args: Any, **kwargs: Any) -> Response:  # type: ignore[override]
+        """Send a request; ``poll=True`` marks an availability poll.
+
+        A poll goes through :attr:`poll_gateway` when one is set, except
+        inside :func:`urgent` (a hit is confirmed over the direct route, with
+        no relay hop in the way). If the relay fails or answers with something
+        that is not the site's own reply (403/429/5xx, a gateway error), the
+        poll is re-sent over the session's own route, so a broken gateway
+        costs latency, never a missed calendar. ``gateway=`` forces a relay
+        for one call with no fallback.
+        """
+        explicit = kwargs.pop("gateway", None)
+        poll = kwargs.pop("poll", False)
+        relay = explicit or (
+            self.poll_gateway
+            if poll and getattr(_urgent, "depth", 0) == 0 else None
+        )
+        if relay is None:
+            return self._attempts(method, args, kwargs, None)
+        try:
+            resp = self._attempts(method, args, kwargs, relay)
+        except RequestException as exc:
+            if explicit is not None:
+                raise
+            reason = f"{type(exc).__name__}: {exc}"
+        else:
+            if explicit is not None or site_replied(resp.status_code):
+                return resp
+            reason = f"HTTP {resp.status_code}"
+        self.gateway_fallbacks += 1
+        self.last_gateway_failure = reason
+        return self._attempts(method, args, kwargs, None)
+
+    def _attempts(self, method: str, args: tuple, kwargs: dict,
+                  relay: Optional[_gateway.Gateway]) -> Response:
+        if relay is not None:
+            target = args[0] if args else kwargs["url"]
+            relayed = {k: v for k, v in kwargs.items() if k not in ("proxies", "url")}
         tries = self.attempts if str(method).upper() in _RETRYABLE_METHODS else 1
         for attempt in range(1, tries + 1):
             if attempt > 1:
@@ -145,13 +194,19 @@ class Session(_curl.Session):
                 self.drop_connection()
             limiter.acquire()
             try:
-                resp = super().request(method, *args, **kwargs)
+                if relay is not None:
+                    resp = _gateway.request(
+                        self._send, relay, self, method, target, **relayed
+                    )
+                else:
+                    resp = super().request(method, *args, **kwargs)
             except RequestException:
                 if attempt == tries:
                     raise
                 continue
             if site_replied(resp.status_code):
-                self.site_replies += 1
+                if relay is None:  # a relayed reply says nothing about our route
+                    self.site_replies += 1
                 return resp
             if attempt == tries:
                 return resp

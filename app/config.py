@@ -621,6 +621,59 @@ def _parse_account(
     )
 
 
+# Names of the non-account secrets in Infisical. config.yaml only says whether
+# each feature is on; the value lives in the vault (or, without a `secrets:`
+# block, in an environment variable of the same name).
+PROXY_SECRET = "AIS_PROXY"
+GATEWAY_URL_SECRET = "STARLINK_GATEWAY_URL"
+GATEWAY_KEY_SECRET = "STARLINK_GATEWAY_KEY"
+CAPSOLVER_SECRET = "CAPSOLVER_API_KEY"
+NEW_RELIC_SECRET = "NEW_RELIC_LICENSE_KEY"
+
+
+class _Vault:
+    """Secret lookup for one config load: Infisical once, then the environment.
+
+    Infisical is only contacted when something actually needs a secret, and
+    at most once. Doubles as the ``client`` ``fill_account_credentials`` uses,
+    so accounts and features share that single fetch.
+    """
+
+    def __init__(self, secrets_raw: Optional[Dict[str, Any]]) -> None:
+        self._raw = secrets_raw
+        self._values: Optional[Dict[str, str]] = None
+
+    def fetch_all(self) -> Dict[str, str]:
+        if self._values is None:
+            if not self._raw:
+                self._values = {}
+            else:
+                from .secrets import InfisicalClient, InfisicalConfig, SecretsError
+                try:
+                    self._values = InfisicalClient(
+                        InfisicalConfig.from_raw(self._raw)).fetch_all()
+                except SecretsError as exc:
+                    raise ConfigError(f"secrets: {exc}") from exc
+        return self._values
+
+    def require(self, key: str, switch: str) -> str:
+        value = str(self.fetch_all().get(key) or os.getenv(key) or "").strip()
+        if not value:
+            where = "Infisical" if self._raw else "the environment (no secrets: block)"
+            raise ConfigError(f"{switch} is on but {key} is not set in {where}")
+        return value
+
+
+def _reject_inline_secret(section: Dict[str, Any], key: str, label: str,
+                          secret: str) -> None:
+    if section.get(key):
+        name = f"{label}.{key}" if label else key
+        raise ConfigError(
+            f"{name} must not be written in config.yaml; store it in Infisical "
+            f"as {secret} and turn the feature on with its enabled/use_ flag"
+        )
+
+
 def load_config(path: Optional[Path] = None) -> Config:
     """Read, interpolate and validate the YAML configuration."""
     path = Path(path or DEFAULT_CONFIG_PATH)
@@ -651,12 +704,13 @@ def load_config(path: Optional[Path] = None) -> Config:
     if not isinstance(accounts_raw, list) or not accounts_raw:
         raise ConfigError("accounts: at least one account is required")
     secrets_raw = raw.get("secrets")
+    if secrets_raw and not isinstance(secrets_raw, dict):
+        raise ConfigError("secrets: expected a mapping")
+    vault = _Vault(secrets_raw or None)
     if secrets_raw:
-        if not isinstance(secrets_raw, dict):
-            raise ConfigError("secrets: expected a mapping")
         from .secrets import SecretsError, fill_account_credentials
         try:
-            fill_account_credentials(accounts_raw, secrets_raw)
+            fill_account_credentials(accounts_raw, secrets_raw, client=vault)
         except SecretsError as exc:
             raise ConfigError(f"secrets: {exc}") from exc
     accounts = [
@@ -692,8 +746,14 @@ def load_config(path: Optional[Path] = None) -> Config:
     )
 
     nr_raw = raw.get("newrelic") or {}
+    if not isinstance(nr_raw, dict):
+        raise ConfigError("newrelic: expected a mapping")
+    _reject_inline_secret(nr_raw, "license_key", "newrelic", NEW_RELIC_SECRET)
     newrelic = NewRelicConfig(
-        license_key=str(nr_raw.get("license_key") or "").strip(),
+        license_key=(
+            vault.require(NEW_RELIC_SECRET, "newrelic.enabled")
+            if _as_bool(nr_raw.get("enabled"), False) else ""
+        ),
         region=str(nr_raw.get("region") or "us").strip().lower(),
         dns_mode=str(nr_raw.get("dns_mode") or "auto").strip().lower(),
         environment=str(nr_raw.get("environment") or "").strip(),
@@ -717,14 +777,25 @@ def load_config(path: Optional[Path] = None) -> Config:
     net_raw = raw.get("network") or {}
     if not isinstance(net_raw, dict):
         raise ConfigError("network: expected a mapping")
+    _reject_inline_secret(net_raw, "proxy", "network", PROXY_SECRET)
+    _reject_inline_secret(net_raw, "gateway_url", "network", GATEWAY_URL_SECRET)
+    _reject_inline_secret(net_raw, "gateway_key", "network", GATEWAY_KEY_SECRET)
+    use_proxy = _as_bool(net_raw.get("use_proxy"), False)
+    use_gateway = _as_bool(net_raw.get("use_gateway"), False)
     network = NetworkConfig(
-        # Empty in the file falls back to the environment, which is how the
-        # compose file routes the container through its VPN sidecar.
+        # The provider URL is not a secret (a container address), so it stays
+        # local; empty falls back to the environment.
         openvpn_provider_url=str(
             net_raw.get("openvpn_provider_url")
             or os.getenv("OPENVPN_PROVIDER_URL") or ""
         ).strip(),
-        proxy=str(net_raw.get("proxy") or os.getenv("AIS_PROXY") or "").strip(),
+        proxy=vault.require(PROXY_SECRET, "network.use_proxy") if use_proxy else "",
+        gateway_url=(
+            vault.require(GATEWAY_URL_SECRET, "network.use_gateway") if use_gateway else ""
+        ),
+        gateway_key=(
+            vault.require(GATEWAY_KEY_SECRET, "network.use_gateway") if use_gateway else ""
+        ),
         ip_ban_detection=_as_bool(net_raw.get("ip_ban_detection"), True),
         direct_fallback=_as_bool(net_raw.get("direct_fallback"), False),
         switch_timeout=max(1, _as_int(
@@ -740,13 +811,33 @@ def load_config(path: Optional[Path] = None) -> Config:
             f"network.proxy: {network.proxy!r} must start with socks5h://, "
             "socks5://, socks4://, http:// or https://"
         )
+    if network.gateway_url:
+        if not re.match(r"^https?://", network.gateway_url):
+            raise ConfigError(
+                f"network.gateway_url: {network.gateway_url!r} must start with "
+                "http:// or https://"
+            )
+        if not network.gateway_key:
+            raise ConfigError(
+                "network.gateway_url is set but network.gateway_key is empty "
+                "(or set STARLINK_GATEWAY_KEY in the environment)"
+            )
     if network.provider_enabled and not network.proxy:
         raise ConfigError(
-            "network.openvpn_provider_url is set but network.proxy is empty, so "
-            "switching profiles would not change the route AIS traffic takes; "
-            "set proxy to the provider's SOCKS address (e.g. "
-            "socks5h://openvpn-socks:1080)"
+            "network.openvpn_provider_url is set but network.use_proxy is off, "
+            "so switching profiles would not change the route AIS traffic "
+            f"takes; turn use_proxy on and store the provider's SOCKS address "
+            f"(e.g. socks5h://openvpn-socks:1080) as {PROXY_SECRET}"
         )
+
+    _reject_inline_secret(raw, "capsolver_api_key", "", CAPSOLVER_SECRET)
+    cap_raw = raw.get("capsolver") or {}
+    if not isinstance(cap_raw, dict):
+        raise ConfigError("capsolver: expected a mapping with `enabled: true|false`")
+    capsolver_api_key = (
+        vault.require(CAPSOLVER_SECRET, "capsolver.enabled")
+        if _as_bool(cap_raw.get("enabled"), False) else ""
+    )
 
     return Config(
         accounts=accounts,
@@ -754,7 +845,7 @@ def load_config(path: Optional[Path] = None) -> Config:
         dashboard=dashboard,
         newrelic=newrelic,
         network=network,
-        capsolver_api_key=str(raw.get("capsolver_api_key") or "").strip(),
+        capsolver_api_key=capsolver_api_key,
         test_mode=_as_bool(raw.get("test_mode"), True),
         poll_interval=_as_int(raw.get("poll_interval"), 300, "poll_interval"),
         http_timeout=_as_int(raw.get("http_timeout"), 30, "http_timeout"),

@@ -471,23 +471,26 @@ def test_network_defaults(tmp_path):
     assert cfg.network.ip_ban_detection and not cfg.network.direct_fallback
 
 
-def test_network_falls_back_to_the_environment(tmp_path, monkeypatch):
+def test_proxy_value_comes_from_the_environment_without_a_vault(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENVPN_PROVIDER_URL", PROVIDER)
     monkeypatch.setenv("AIS_PROXY", SOCKS)
-    cfg = load_config(write(tmp_path, BASE))
+    cfg = load_config(write(tmp_path, BASE + "network: {use_proxy: true}\n"))
     assert cfg.network.openvpn_provider_url == PROVIDER
     assert cfg.network.proxy == SOCKS
 
-    # An explicit value in the file still wins.
-    cfg = load_config(write(tmp_path, BASE + "network: {proxy: socks5h://other:1080}\n"))
-    assert cfg.network.proxy == "socks5h://other:1080"
+
+def test_proxy_switch_off_ignores_the_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIS_PROXY", SOCKS)
+    cfg = load_config(write(tmp_path, BASE))
+    assert cfg.network.proxy == ""
 
 
-def test_network_parsed(tmp_path):
+def test_network_parsed(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIS_PROXY", SOCKS)
     cfg = load_config(write(tmp_path, BASE + f"""
 network:
   openvpn_provider_url: {PROVIDER}
-  proxy: {SOCKS}
+  use_proxy: true
   direct_fallback: true
   pause_on_ip_ban: 60
 """))
@@ -495,15 +498,21 @@ network:
     assert cfg.network.direct_fallback and cfg.network.pause_on_ip_ban == 60
 
 
-def test_provider_without_proxy_is_rejected(tmp_path):
-    with pytest.raises(ConfigError, match="proxy"):
+def test_provider_without_proxy_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.delenv("AIS_PROXY", raising=False)
+    with pytest.raises(ConfigError, match="use_proxy"):
         load_config(write(tmp_path, BASE + f"network: {{openvpn_provider_url: {PROVIDER}}}\n"))
 
 
-def test_bad_proxy_scheme_is_rejected(tmp_path):
+def test_bad_proxy_scheme_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIS_PROXY", "ftp://x:1")
     with pytest.raises(ConfigError, match="network.proxy"):
-        load_config(write(tmp_path, BASE + "network: {proxy: ftp://x:1}\n"))
+        load_config(write(tmp_path, BASE + "network: {use_proxy: true}\n"))
 
+
+def test_an_inline_proxy_is_refused(tmp_path):
+    with pytest.raises(ConfigError, match="store it in Infisical as AIS_PROXY"):
+        load_config(write(tmp_path, BASE + f"network: {{proxy: {SOCKS}}}\n"))
 
 def test_dashboard_switch_needs_the_xhr_header(tmp_path):
     from fastapi.testclient import TestClient
