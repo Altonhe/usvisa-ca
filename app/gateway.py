@@ -132,6 +132,10 @@ def request(
             headers={KEY_HEADER: gateway.key, "content-type": "application/json"},
             allow_redirects=False,
             discard_cookies=True,  # the gateway's own cookies are not AIS's
+            # Straight to the gateway, never through the session's proxy: the
+            # relay exists to take polling load (and bytes) off that proxy,
+            # and must keep working when the proxy is down.
+            proxies={},
         )
         if timeout is not None:
             kwargs["timeout"] = timeout

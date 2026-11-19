@@ -136,6 +136,19 @@ def test_json_headers_and_params_are_relayed(gateway_server):
         s.close()
 
 
+def test_the_gateway_hop_skips_the_sessions_proxy(gateway_server):
+    # Sign-in goes over the SOCKS proxy; polls must reach the gateway even
+    # when that proxy is dead. Port 9 refuses, so using it would fail.
+    gw, calls = gateway_server
+    s = session(gw)
+    s.proxies = {"http": "socks5h://127.0.0.1:9", "https": "socks5h://127.0.0.1:9"}
+    try:
+        assert s.get(SITE + "/days.json", timeout=5).status_code == 200
+        assert len(calls) == 1
+    finally:
+        s.close()
+
+
 def test_head_is_sent_as_get(gateway_server):
     # The gateway only speaks GET and POST; the probe's HEAD must not reach it.
     gw, calls = gateway_server
