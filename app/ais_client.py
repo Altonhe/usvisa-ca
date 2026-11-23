@@ -1043,6 +1043,7 @@ class AisClient:
         are made (spaced ``retry_delay`` seconds apart) before giving up,
         instead of abandoning the match until the next full poll_interval.
         """
+        self._log(f"booking without prewarmed form for schedule {slot.schedule_id}")
         with self._log_booking_step(slot, "appointment form"):
             page = self.open_appointment_page(slot.schedule_id)
             form = page.form_by_id("appointment-form")

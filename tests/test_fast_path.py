@@ -200,9 +200,10 @@ def test_booking_distinguishes_empty_times_from_failed_lookups(
 
     if prewarmed:
         assert c.book_prewarmed(slot, _warm(), dry_run=False) is False
-        assert any("booking with prewarmed form" in line for line in logs)
+        assert logs[0].startswith("booking with prewarmed form for schedule 111 (form age ")
     else:
         assert c.book(slot, dry_run=False, retry_attempts=2) is False
+        assert logs[0] == "booking without prewarmed form for schedule 111"
         assert any("booking appointment form" in line for line in logs)
         assert any("booking wait before times.json attempt 2/2" in line for line in logs)
 
