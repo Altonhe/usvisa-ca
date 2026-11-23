@@ -1670,24 +1670,35 @@ class Worker:
         # the last slot on this day within seconds, so nothing should sit
         # between the match and the booking request itself. The Telegram
         # message still reports what was attempted, just a moment later.
+        started = time.perf_counter()
         try:
             with http.urgent():  # booking races other people: no rate limit
                 ok = self._book(client, app, slot)
         except AisError as exc:
-            self.log(f"[{account.name}] booking failed: {exc}")
+            self.log(
+                f"[{account.name}] booking failed: {exc} "
+                f"({time.perf_counter() - started:.3f}s total)"
+            )
             self.store.update_application(
                 account.name, app.schedule_id, message=f"booking failed: {exc}"
             )
             self.notifier.booking_failed(account.name, app.display_name, str(exc))
             return
         except Exception as exc:  # noqa: BLE001 - keep other applications alive
-            self.log(f"[{account.name}] unexpected booking error: {exc}")
+            self.log(
+                f"[{account.name}] unexpected booking error: {exc} "
+                f"({time.perf_counter() - started:.3f}s total)"
+            )
             traceback.print_exc()
             self.store.update_application(
                 account.name, app.schedule_id, message=f"booking error: {exc}"
             )
             return
 
+        self.log(
+            f"[{account.name}] booking attempt for schedule {slot.schedule_id} "
+            f"took {time.perf_counter() - started:.3f}s total"
+        )
         if ok:
             self._booked[app.schedule_id] = True
             # The site's own view of this application just changed, so the

@@ -12,6 +12,7 @@ import pytest
 
 from app.ais_client import AisClient, PrewarmedForm, Slot
 from app.config import Config, DashboardConfig, TelegramConfig
+from app.htmlutil import Page
 from app.notifier import TelegramNotifier
 from app.store import Store
 from app.worker import Worker
@@ -152,6 +153,8 @@ def test_dry_run_prewarmed_booking_sends_nothing(monkeypatch):
 def test_prewarmed_booking_posts_the_expected_payload(monkeypatch):
     c = client()
     captured = {}
+    logs = []
+    monkeypatch.setattr(c, "_log", logs.append)
 
     def fake_post(url, data=None, headers=None, timeout=None, allow_redirects=None):
         captured["url"] = url
@@ -171,17 +174,41 @@ def test_prewarmed_booking_posts_the_expected_payload(monkeypatch):
     assert data["appointments[consulate_appointment][time]"] == "07:15"
     assert data["authenticity_token"] == "tok"
     assert captured["headers"]["X-CSRF-Token"] == "tok"
+    assert any("booking POST for schedule 111 took " in line for line in logs)
+    assert any("booking confirmation for schedule 111 took " in line for line in logs)
     # A consumed token must not be reused.
     assert c.peek_prewarmed("111", 120) is None
 
 
-def test_prewarmed_booking_gives_up_when_the_day_has_no_times(monkeypatch):
-    c = client()
-    monkeypatch.setattr(c, "get_available_times", lambda s, f, d: [])
+@pytest.mark.parametrize("prewarmed", [True, False], ids=["prewarmed", "fresh-form"])
+@pytest.mark.parametrize("response, outcome", [
+    pytest.param(Resp(200, {"available_times": [None]}), "no time slots", id="empty"),
+    pytest.param(Resp(503), "request failed", id="http-error"),
+    pytest.param(Resp(200, {"error": "unavailable"}), "request failed", id="bad-payload"),
+])
+def test_booking_distinguishes_empty_times_from_failed_lookups(
+    monkeypatch, prewarmed, response, outcome
+):
+    logs = []
+    c = AisClient("a@example.com", "p", logger=logs.append)
+    page = Page('<form id="appointment-form" action="/submit"></form>')
+    monkeypatch.setattr(c, "_get_page", lambda url, referer="": page)
+    monkeypatch.setattr(c.session, "get", lambda url, **kwargs: response)
     monkeypatch.setattr(c.session, "post",
                         lambda *a, **k: pytest.fail("must not POST without a time"))
     slot = Slot("111", 94, date(2027, 7, 29))
-    assert c.book_prewarmed(slot, _warm(), dry_run=False) is False
+
+    if prewarmed:
+        assert c.book_prewarmed(slot, _warm(), dry_run=False) is False
+        assert any("booking with prewarmed form" in line for line in logs)
+    else:
+        assert c.book(slot, dry_run=False, retry_attempts=2) is False
+        assert any("booking appointment form" in line for line in logs)
+        assert any("booking wait before times.json attempt 2/2" in line for line in logs)
+
+    lookups = [line for line in logs if line.startswith("times.json for schedule 111")]
+    assert len(lookups) == (1 if prewarmed else 2)
+    assert all(f": {outcome} (" in line and line.endswith("s)") for line in lookups)
 
 
 def test_speculative_skips_times_json_when_a_roster_is_remembered(monkeypatch):

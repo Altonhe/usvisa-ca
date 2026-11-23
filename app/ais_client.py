@@ -29,11 +29,12 @@ import json
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from html import unescape
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 from urllib.parse import urlencode
 
 from . import httpclient as http
@@ -717,14 +718,40 @@ class AisClient:
         self, schedule_id: str, facility_id: int, day: date
     ) -> Optional[List[str]]:
         """Time slots for one day; ``[]`` when none, ``None`` on error."""
+        started = time.perf_counter()
+        times = None
+        try:
+            times = self._read_available_times(schedule_id, facility_id, day)
+            return times
+        finally:
+            if times is None:
+                outcome = "request failed"
+            elif not times:
+                outcome = "no time slots"
+            else:
+                outcome = f"{len(times)} time slot(s) available"
+            self._log(
+                f"times.json for schedule {schedule_id}, {consulate_name(facility_id)} "
+                f"@ {day}: {outcome} ({time.perf_counter() - started:.3f}s)"
+            )
+
+    def _read_available_times(
+        self, schedule_id: str, facility_id: int, day: date
+    ) -> Optional[List[str]]:
         data = self._get_json(
             self.times_url(schedule_id, facility_id, day),
             referer=self.appointment_url(schedule_id),
         )
         if data is None:
             return None
-        if not isinstance(data, dict):
-            self._log(f"unexpected times payload: {data!r}"[:160])
+        fields = ("available_times", "business_times")
+        if (
+            not isinstance(data, dict)
+            or not any(field in data for field in fields)
+            or any(data.get(field) is not None and not isinstance(data[field], list)
+                   for field in fields)
+        ):
+            self._log("unexpected times.json payload: expected time lists")
             return None
         # The site can answer {"available_times": [null], ...} for a day that
         # days.json still lists (the last slot just went). [None] is truthy,
@@ -740,6 +767,17 @@ class AisClient:
         return clean(data.get("available_times")) or clean(data.get("business_times"))
 
     # -- booking ---------------------------------------------------------
+
+    @contextmanager
+    def _log_booking_step(self, slot: Slot, step: str) -> Iterator[None]:
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._log(
+                f"booking {step} for schedule {slot.schedule_id} took "
+                f"{time.perf_counter() - started:.3f}s"
+            )
 
     def open_appointment_page(self, schedule_id: str) -> Page:
         """Reach the appointment form, clearing any interstitial on the way.
@@ -908,6 +946,10 @@ class AisClient:
         proceeds normally. Off by default: what the site does with a POST
         naming an unavailable time cannot be established without sending one.
         """
+        self._log(
+            f"booking with prewarmed form for schedule {slot.schedule_id} "
+            f"(form age {warmed.age():.1f}s)"
+        )
         payload = dict(warmed.payload)
         payload[FACILITY_KEY] = str(slot.facility_id)
         payload[DATE_KEY] = slot.day.isoformat()
@@ -925,9 +967,12 @@ class AisClient:
             )
             attempt = dict(payload)
             attempt[TIME_KEY] = guess
-            resp = self._post_prewarmed(attempt, warmed)
+            with self._log_booking_step(slot, "speculative POST"):
+                resp = self._post_prewarmed(attempt, warmed)
             slot.time = guess
-            if self._confirm_booking(slot, resp, Page(resp.text, base_url=resp.url)):
+            with self._log_booking_step(slot, "confirmation"):
+                confirmed = self._confirm_booking(slot, resp, Page(resp.text, base_url=resp.url))
+            if confirmed:
                 self.invalidate_prewarm(slot.schedule_id)
                 return True
             slot.time = ""
@@ -936,7 +981,6 @@ class AisClient:
         if not slot.time:
             times = self.get_available_times(slot.schedule_id, slot.facility_id, slot.day)
             if not times:
-                self._log(f"no time slots left on {slot.day} at {slot.consulate}")
                 return False
             self.remember_times(slot.schedule_id, slot.facility_id, times)
             slot.time = times[0]
@@ -957,10 +1001,12 @@ class AisClient:
             )
             return False
 
-        resp = self._post_prewarmed(payload, warmed)
+        with self._log_booking_step(slot, "POST"):
+            resp = self._post_prewarmed(payload, warmed)
         # A used token cannot be reused, and the form state is now stale.
         self.invalidate_prewarm(slot.schedule_id)
-        return self._confirm_booking(slot, resp, Page(resp.text, base_url=resp.url))
+        with self._log_booking_step(slot, "confirmation"):
+            return self._confirm_booking(slot, resp, Page(resp.text, base_url=resp.url))
 
     def _post_prewarmed(self, payload, warmed):
         """POST a booking using the pre-warmed form's token and referer."""
@@ -997,9 +1043,10 @@ class AisClient:
         are made (spaced ``retry_delay`` seconds apart) before giving up,
         instead of abandoning the match until the next full poll_interval.
         """
-        page = self.open_appointment_page(slot.schedule_id)
-        form = page.form_by_id("appointment-form")
-        payload = form.payload()
+        with self._log_booking_step(slot, "appointment form"):
+            page = self.open_appointment_page(slot.schedule_id)
+            form = page.form_by_id("appointment-form")
+            payload = form.payload()
 
         for key in (FACILITY_KEY, DATE_KEY, TIME_KEY):
             if key not in payload:
@@ -1015,14 +1062,11 @@ class AisClient:
                 if times:
                     break
                 if attempt < retry_attempts:
-                    self._log(
-                        f"no time slots on {slot.day} at {slot.consulate} yet "
-                        f"(attempt {attempt}/{retry_attempts}), retrying in "
-                        f"{retry_delay}s"
-                    )
-                    time.sleep(retry_delay)
+                    with self._log_booking_step(
+                        slot, f"wait before times.json attempt {attempt + 1}/{retry_attempts}"
+                    ):
+                        time.sleep(retry_delay)
             if not times:
-                self._log(f"no time slots left on {slot.day} at {slot.consulate}")
                 return False
             slot.time = times[0]
         if not _usable_time(slot.time):
@@ -1030,7 +1074,8 @@ class AisClient:
             return False
         payload[TIME_KEY] = slot.time
         payload.setdefault("commit", "Submit")
-        payload.update(self._solve_captcha(page, form.action))
+        with self._log_booking_step(slot, "CAPTCHA check"):
+            payload.update(self._solve_captcha(page, form.action))
 
         redacted = {k: v for k, v in payload.items() if k != "authenticity_token"}
         self._log(f"booking payload: {json.dumps(redacted, ensure_ascii=False)}")
@@ -1042,8 +1087,10 @@ class AisClient:
             )
             return False
 
-        resp = self._post_form(form.action, payload, page)
-        return self._confirm_booking(slot, resp, Page(resp.text, base_url=resp.url))
+        with self._log_booking_step(slot, "POST"):
+            resp = self._post_form(form.action, payload, page)
+        with self._log_booking_step(slot, "confirmation"):
+            return self._confirm_booking(slot, resp, Page(resp.text, base_url=resp.url))
 
     def _confirm_booking(self, slot: Slot, resp, result: Page) -> bool:
         """Decide whether the POST actually moved the appointment."""
