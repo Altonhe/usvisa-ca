@@ -6,6 +6,7 @@ candidates are chosen and once more right before anything is POSTed.
 """
 
 from datetime import date
+from threading import Event, Thread
 
 from app.ais_client import Schedule, Slot
 from app.config import (Account, Application, Config, DashboardConfig, Group,
@@ -164,6 +165,41 @@ def test_attempt_booking_allows_an_earlier_slot(tmp_path):
     app = Application(schedule_id="111", label="x", target=target())
     worker._attempt_booking(account, client, app,
                             Slot("111", TRT, date(2027, 1, 15)), reschedule())
+    assert len(client.booked) == 1
+
+
+def test_booking_claim_blocks_concurrent_and_later_duplicate_attempts(tmp_path):
+    worker, account = build(tmp_path)
+    worker.config.test_mode = False
+    started = Event()
+    finish = Event()
+
+    class BlockingClient(FakeClient):
+        def book(self, slot, **kwargs):
+            self.booked.append(slot)
+            started.set()
+            return finish.wait(timeout=3)
+
+    client = BlockingClient()
+    app = Application(schedule_id="111", label="x", target=target())
+    day = date(2027, 1, 15)
+
+    def attempt():
+        worker._attempt_booking(account, client, app, Slot("111", TRT, day), reschedule())
+
+    active = Thread(target=attempt)
+    active.start()
+    try:
+        assert started.wait(timeout=3)
+        attempt()
+        assert len(client.booked) == 1
+    finally:
+        finish.set()
+        active.join(timeout=3)
+
+    assert not active.is_alive()
+    assert worker._booked["111"]
+    attempt()
     assert len(client.booked) == 1
 
 

@@ -159,7 +159,7 @@ network:
   # detected (accounts are not wrongly rested) and the pool pauses instead.
   # Falls back to $OPENVPN_PROVIDER_URL.
   openvpn_provider_url: ""        # http://openvpn-provider:8080
-  # Send every AIS request through the proxy stored as AIS_PROXY
+  # Use the proxy stored as AIS_PROXY for the primary AIS session
   # (e.g. socks5h://user:pass@host:1080; socks5h resolves DNS on the proxy).
   # Off: direct. Sign-in, discovery and booking always take this route.
   use_proxy: false
@@ -173,6 +173,8 @@ network:
   # Off by default: it puts your real IP in front of the site. While on it,
   # the VPN is re-checked every vpn_retry_interval seconds and traffic moves
   # back as soon as a profile is accepted.
+  # With a SOCKS5 proxy configured, this also allows times.json to query both
+  # routes in parallel. The first response with usable times supplies the slot.
   direct_fallback: false
   vpn_retry_interval: 300
   # Seconds to wait for a switched profile to connect.

@@ -7,10 +7,11 @@ with a populated authenticity_token), and the adaptive poll interval.
 """
 
 from datetime import date
+from threading import Barrier, Event
 
 import pytest
 
-from app.ais_client import AisClient, PrewarmedForm, Slot
+from app.ais_client import AisClient, PrewarmedForm, SessionExpired, Slot
 from app.config import Config, DashboardConfig, TelegramConfig
 from app.htmlutil import Page
 from app.notifier import TelegramNotifier
@@ -210,6 +211,88 @@ def test_booking_distinguishes_empty_times_from_failed_lookups(
     lookups = [line for line in logs if line.startswith("times.json for schedule 111")]
     assert len(lookups) == (1 if prewarmed else 2)
     assert all(f": {outcome} (" in line and line.endswith("s)") for line in lookups)
+
+
+def test_first_valid_route_can_book_while_the_other_route_is_running(monkeypatch):
+    logs = []
+    both_running = Barrier(2)
+    release_proxy = Event()
+    proxy_logged = Event()
+    posts = []
+    proxy_url = "socks5h://proxy.invalid:1080"
+
+    def log(line):
+        logs.append(line)
+        if "route=socks5h: " in line:
+            proxy_logged.set()
+
+    c = AisClient("a@example.com", "p", logger=log, times_socks_proxy=proxy_url)
+    c.session.cookies.set("_yatri_session", "signed-in", domain="ais.usvisa-info.com")
+
+    def times(schedule_id, facility_id, day, session, **kwargs):
+        if session.proxies:
+            assert session.proxies["all"] == proxy_url
+            session.cookies.set("_yatri_session", "losing-cookie", domain="ais.usvisa-info.com")
+            both_running.wait(timeout=3)
+            assert release_proxy.wait(timeout=3)
+            return ["08:30"]
+        both_running.wait(timeout=3)
+        assert session.cookies.get("_yatri_session") == "signed-in"
+        return ["07:15"]
+
+    def post(url, data, **kwargs):
+        posts.append(data)
+        assert not proxy_logged.is_set()
+        return Resp(200, text="successfully scheduled")
+
+    monkeypatch.setattr(c, "_read_available_times", times)
+    monkeypatch.setattr(c.session, "post", post)
+    slot = Slot("111", 94, date(2027, 7, 29))
+    try:
+        # Even an enabled speculative setting must yield to the route race.
+        assert c.book_prewarmed(slot, _warm({94: ["06:30"]}), dry_run=False, speculative=True)
+        assert slot.time == "07:15"
+        assert any("winner=direct" in line for line in logs)
+    finally:
+        release_proxy.set()
+        assert proxy_logged.wait(timeout=3)
+
+    assert any("route=socks5h: 1 time slot(s) available" in line for line in logs)
+    assert c.session.cookies.get("_yatri_session") == "signed-in"
+    assert len(posts) == 1
+
+
+@pytest.mark.parametrize("direct_result", [[], None, ["invalid"], SessionExpired("401")])
+def test_empty_failed_or_invalid_route_waits_for_a_valid_result(monkeypatch, direct_result):
+    first_result = Event()
+    logs = []
+
+    def log(line):
+        logs.append(line)
+        if "route=direct: " in line:
+            first_result.set()
+
+    c = AisClient("a@example.com", "p", logger=log, times_socks_proxy="socks5://proxy.invalid:1080")
+
+    def times(schedule_id, facility_id, day, session, **kwargs):
+        if session.proxies:
+            assert first_result.wait(timeout=3)
+            return ["08:30"]
+        if isinstance(direct_result, Exception):
+            raise direct_result
+        return direct_result
+
+    monkeypatch.setattr(c, "_read_available_times", times)
+    assert c.get_available_times("111", 94, date(2027, 7, 29)) == ["08:30"]
+    assert any("winner=socks5" in line for line in logs)
+
+
+@pytest.mark.parametrize("proxy_result, expected", [([], []), (None, None)])
+def test_race_with_no_winner_distinguishes_empty_from_incomplete(monkeypatch, proxy_result, expected):
+    c = AisClient("a@example.com", "p", times_socks_proxy="socks5://proxy.invalid:1080")
+    monkeypatch.setattr(c, "_read_available_times",
+                        lambda s, f, d, session, **kw: proxy_result if session.proxies else [])
+    assert c.get_available_times("111", 94, date(2027, 7, 29)) == expected
 
 
 def test_speculative_skips_times_json_when_a_roster_is_remembered(monkeypatch):

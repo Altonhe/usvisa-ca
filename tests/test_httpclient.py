@@ -142,15 +142,23 @@ def flaky_server():
 def test_refused_get_is_retried_on_a_fresh_connection(flaky_server):
     url, state = flaky_server
     state["fails"] = 2
+    logs = []
     session = http.Session()
     try:
-        resp = session.get(url + "/days.json", timeout=5)
+        with http.log_attempts(logs.append, "times.json HTTP"):
+            resp = session.get(url + "/times.json", timeout=5)
     finally:
         session.close()
     assert resp.status_code == 200
     assert session.retries == 2 and session.site_replies == 1
     ports = state["ports"]
     assert len(ports) == 3 and len(set(ports)) == 3, "each retry must reconnect"
+    assert [line.split(" outcome=")[0] for line in logs[:3]] == [
+        f"times.json HTTP attempt {number}/3: route=direct" for number in (1, 2, 3)
+    ]
+    assert all("outcome=HTTP 403" in line for line in logs[:2])
+    assert "outcome=HTTP 200" in logs[2] and "wait_first_byte=n/a" not in logs[2]
+    assert "attempts=3 retries=2 retry_time=" in logs[3]
 
 
 def test_three_refusals_return_the_last_reply(flaky_server):
@@ -177,13 +185,17 @@ def test_post_is_never_retried(flaky_server):
 
 
 def test_connect_failure_is_retried_then_raised():
+    logs = []
     session = http.Session()
     try:
-        with pytest.raises(http.RequestException):
+        with pytest.raises(http.RequestException), http.log_attempts(logs.append, "failed GET"):
             session.get("http://127.0.0.1:9/", timeout=2)
     finally:
         session.close()
     assert session.retries == 2
+    assert len(logs) == 4
+    assert all("setup_until_error=" in line and "wait_until_error=n/a" in line
+               for line in logs[:3])
 
 
 def test_retry_keeps_the_login_cookie(local_server):

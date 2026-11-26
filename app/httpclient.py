@@ -24,10 +24,14 @@ from __future__ import annotations
 import contextlib
 import threading
 import time
-from typing import Any, Iterator, Optional
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterator, Optional
+from urllib.parse import urlsplit
 
+from curl_cffi import CurlInfo, CurlOpt
 from curl_cffi import requests as _curl
-from curl_cffi.requests import Response  # noqa: F401 - re-exported
+from curl_cffi.requests import Cookies, Response  # noqa: F401 - re-exported
 from curl_cffi.requests.exceptions import (  # noqa: F401 - re-exported
     ConnectionError,
     HTTPError,
@@ -115,6 +119,97 @@ DEFAULT_ATTEMPTS = 3
 # Only these are retried: replaying a POST could submit a booking twice.
 _RETRYABLE_METHODS = frozenset({"GET", "HEAD"})
 
+_ATTEMPT_INFOS = (
+    CurlInfo.CONNECT_TIME_T,
+    CurlInfo.PRETRANSFER_TIME_T,
+    CurlInfo.POSTTRANSFER_TIME_T,
+    CurlInfo.STARTTRANSFER_TIME_T,
+    CurlInfo.TOTAL_TIME_T,
+    CurlInfo.NUM_CONNECTS,
+    CurlInfo.USED_PROXY,
+)
+
+
+@dataclass
+class _AttemptTrace:
+    lines: list[str] = field(default_factory=list)
+    retry_time: float = 0.0
+
+
+_attempt_trace: ContextVar[Optional[_AttemptTrace]] = ContextVar("http_attempt_trace", default=None)
+
+
+@contextlib.contextmanager
+def log_attempts(log: Callable[[str], None], label: str) -> Iterator[None]:
+    """Log transport attempts after the request, without logging URLs or credentials."""
+    trace = _AttemptTrace()
+    token = _attempt_trace.set(trace)
+    try:
+        yield
+    finally:
+        _attempt_trace.reset(token)
+        for line in trace.lines:
+            log(f"{label} {line}")
+        if trace.lines:
+            log(
+                f"{label} summary: attempts={len(trace.lines)} retries={len(trace.lines) - 1} "
+                f"retry_time={trace.retry_time:.3f}s"
+            )
+
+
+def _attempt_details(response: Optional[Response], error: str, proxy_scheme: str) -> str:
+    infos = getattr(response, "infos", {})
+    used_proxy = infos.get(CurlInfo.USED_PROXY)
+    if used_proxy:
+        route = proxy_scheme or "proxy"
+    elif used_proxy == 0 and (not error or getattr(response, "primary_ip", "")):
+        route = "direct"
+    else:
+        route = "unknown"
+
+    connected = infos.get(CurlInfo.CONNECT_TIME_T)
+    ready = infos.get(CurlInfo.PRETRANSFER_TIME_T)
+    sent = infos.get(CurlInfo.POSTTRANSFER_TIME_T)
+    first_byte = infos.get(CurlInfo.STARTTRANSFER_TIME_T)
+    total = infos.get(CurlInfo.TOTAL_TIME_T)
+    new_connections = infos.get(CurlInfo.NUM_CONNECTS, "n/a")
+    status = getattr(response, "status_code", 0)
+    if error and not status:
+        # libcurl can fill missing milestones with the end time on failure.
+        first_byte = None
+        if not getattr(response, "request_size", 0):
+            ready = sent = None
+
+    def seconds(micros: Optional[int]) -> str:
+        return f"{micros / 1_000_000:.3f}s" if micros is not None else "n/a"
+
+    # A request that was sent can still time out before its first byte, in
+    # which case the wait ends at the transfer failure.
+    body_time = total - first_byte if first_byte and total and total >= first_byte else None
+    send_time = sent - ready if sent and ready and sent >= ready else None
+    wait_end = first_byte or (total if error else None)
+    wait_time = wait_end - sent if wait_end and sent and wait_end >= sent else None
+    wait_label = "wait_first_byte" if first_byte or not error else "wait_until_error"
+    setup_label = "setup"
+    setup_time = ready
+    if error and ready is None and total is not None:
+        setup_label = "setup_until_error"
+        setup_time = total
+    connect_time = None if error and not connected else connected
+    outcome = error or f"HTTP {status}"
+    details = (
+        f"route={route} outcome={outcome} connect={seconds(connect_time)} "
+        f"{setup_label}={seconds(setup_time)} send={seconds(send_time)} "
+        f"{wait_label}={seconds(wait_time)} "
+        f"receive={seconds(body_time)} curl={seconds(total)} new_connections={new_connections}"
+    )
+    if route == "unknown" and proxy_scheme:
+        details += f" configured_proxy={proxy_scheme}"
+    redirects = getattr(response, "redirect_count", 0)
+    if redirects:
+        details += f" redirects={redirects}"
+    return details
+
 
 class Session(_curl.Session):
     """A curl_cffi session that impersonates Chrome unless told otherwise.
@@ -135,6 +230,7 @@ class Session(_curl.Session):
 
     def __init__(self, attempts: int = DEFAULT_ATTEMPTS, **kwargs: Any) -> None:
         kwargs.setdefault("impersonate", IMPERSONATE)
+        kwargs.setdefault("curl_infos", list(_ATTEMPT_INFOS))
         super().__init__(**kwargs)
         self.site_replies = 0
         self.attempts = max(1, int(attempts))
@@ -153,9 +249,8 @@ class Session(_curl.Session):
         """Send a request; ``poll=True`` marks an availability poll.
 
         A poll goes through :attr:`poll_gateway` when one is set, except
-        inside :func:`urgent` (a hit is confirmed over the direct route, with
-        no relay hop in the way). If the relay fails or answers with something
-        that is not the site's own reply (403/429/5xx, a gateway error), the
+        inside :func:`urgent`, which uses the session's own route. If the relay
+        fails or returns a 403/429/5xx that is not the site's own reply, the
         poll is re-sent over the session's own route, so a broken gateway
         costs latency, never a missed calendar. ``gateway=`` forces a relay
         for one call with no fallback.
@@ -184,15 +279,32 @@ class Session(_curl.Session):
 
     def _attempts(self, method: str, args: tuple, kwargs: dict,
                   relay: Optional[_gateway.Gateway]) -> Response:
+        trace = _attempt_trace.get()
+        proxy_scheme = ""
+        if trace is not None and relay is None:
+            url = urlsplit(args[0] if args else kwargs["url"])
+            proxies = kwargs.get("proxies")
+            if proxies is None:
+                proxies = self.proxies
+            proxy = (kwargs.get("proxy") or proxies.get(f"{url.scheme}://{url.hostname}")
+                     or proxies.get(f"all://{url.hostname}") or proxies.get(url.scheme)
+                     or proxies.get("all") or "")
+            scheme = proxy.partition("://")[0].lower()
+            if scheme in {"http", "https", "socks4", "socks4a", "socks5", "socks5h"}:
+                proxy_scheme = scheme
         if relay is not None:
             target = args[0] if args else kwargs["url"]
             relayed = {k: v for k, v in kwargs.items() if k not in ("proxies", "url")}
         tries = self.attempts if str(method).upper() in _RETRYABLE_METHODS else 1
         for attempt in range(1, tries + 1):
+            started = time.perf_counter() if trace is not None else 0.0
             if attempt > 1:
                 self.retries += 1
                 self.drop_connection()
             limiter.acquire()
+            curl_started = time.perf_counter() if trace is not None else 0.0
+            resp = None
+            error = ""
             try:
                 if relay is not None:
                     resp = _gateway.request(
@@ -200,10 +312,22 @@ class Session(_curl.Session):
                     )
                 else:
                     resp = super().request(method, *args, **kwargs)
-            except RequestException:
+            except RequestException as exc:
+                resp = exc.response
+                error = type(exc).__name__
                 if attempt == tries:
                     raise
                 continue
+            finally:
+                if trace is not None and (resp is not None or error):
+                    elapsed = time.perf_counter() - started
+                    if trace.lines:
+                        trace.retry_time += elapsed
+                    details = _attempt_details(resp, error, proxy_scheme)
+                    trace.lines.append(
+                        f"attempt {attempt}/{tries}: {details} "
+                        f"before_curl={curl_started - started:.3f}s wall={elapsed:.3f}s"
+                    )
             if site_replied(resp.status_code):
                 if relay is None:  # a relayed reply says nothing about our route
                     self.site_replies += 1

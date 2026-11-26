@@ -78,6 +78,8 @@ class Worker:
         # schedule_id -> True once booked, so a restart or a later sweep does
         # not try to rebook something that is already settled.
         self._booked: Dict[str, bool] = {}
+        self._booking_lock = threading.Lock()
+        self._booking_in_flight: Set[str] = set()
         # Latest joint-availability check per (account, members, consulate),
         # rebuilt every sweep and pushed to New Relic alongside the regular
         # per-application metrics. Not persisted -- it is a live report, not
@@ -1070,6 +1072,9 @@ class Worker:
             timeout=self.config.http_timeout,
             request_delay=self.config.consulate_poll_delay,
             logger=lambda m: self.log(f"[{account.name}] {m}"),
+            times_socks_proxy=(
+                self.config.network.proxy if self.config.network.direct_fallback else ""
+            ),
         )
         session_path = self._session_path(account.name)
         resumed = False
@@ -1652,6 +1657,21 @@ class Worker:
         self, account: Account, client: AisClient, app: Application, slot: Slot,
         schedule: Optional[Schedule] = None,
     ) -> None:
+        schedule_id = app.schedule_id
+        with self._booking_lock:
+            if self._booked.get(schedule_id) or schedule_id in self._booking_in_flight:
+                return
+            self._booking_in_flight.add(schedule_id)
+        try:
+            self._run_booking(account, client, app, slot, schedule)
+        finally:
+            with self._booking_lock:
+                self._booking_in_flight.remove(schedule_id)
+
+    def _run_booking(
+        self, account: Account, client: AisClient, app: Application, slot: Slot,
+        schedule: Optional[Schedule],
+    ) -> None:
         # Last line of defence before anything is POSTed: whatever path got us
         # here, an existing appointment is only ever moved earlier.
         can_book, ceiling = self._booking_ceiling(schedule)
@@ -1700,7 +1720,8 @@ class Worker:
             f"took {time.perf_counter() - started:.3f}s total"
         )
         if ok:
-            self._booked[app.schedule_id] = True
+            with self._booking_lock:
+                self._booked[app.schedule_id] = True
             # The site's own view of this application just changed, so the
             # cached discovery no longer describes it, and the consumed
             # authenticity_token cannot be reused.

@@ -33,7 +33,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from html import unescape
+from itertools import count
 from pathlib import Path
+from queue import Queue
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 from urllib.parse import urlencode
 
@@ -56,6 +58,7 @@ RESCHEDULE_LABEL = "reschedule appointment"
 FACILITY_KEY = "appointments[consulate_appointment][facility_id]"
 DATE_KEY = "appointments[consulate_appointment][date]"
 TIME_KEY = "appointments[consulate_appointment][time]"
+SITE_TIME_RE = re.compile(r"(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?", re.ASCII)
 
 
 def _usable_time(value) -> bool:
@@ -180,6 +183,7 @@ class AisClient:
         request_delay: float = 0.0,
         max_connections: int = 4,
         logger: Optional[Callable[[str], None]] = None,
+        times_socks_proxy: str = "",
     ):
         if not email or not password:
             raise AisError("account email/password are not configured")
@@ -198,6 +202,14 @@ class AisClient:
         # Pre-warmed booking form state, keyed by schedule_id.
         self._prewarmed: Dict[str, "PrewarmedForm"] = {}
         self._prewarm_lock = threading.Lock()
+        proxy_scheme, separator, _ = times_socks_proxy.partition("://")
+        self._times_socks_proxy = (
+            times_socks_proxy if separator and proxy_scheme.lower() in ("socks5", "socks5h") else ""
+        )
+        # The losing GET can finish in the background. Keep at most one query
+        # per route in flight for this client, including across repeat lookups.
+        self._times_route_locks = (threading.Lock(), threading.Lock())
+        self._times_lookup_ids = count(1)
         # curl_cffi with a Chrome TLS fingerprint. The availability sweep fires
         # several days.json calls at once; the session keeps one libcurl handle
         # per thread, so concurrent calls each get their own connection while
@@ -288,7 +300,10 @@ class AisClient:
         payload, _etag, _fresh = self._get_json_meta(url, referer=referer)
         return payload
 
-    def _get_json_meta(self, url: str, referer: str = "", poll: bool = False):
+    def _get_json_meta(
+        self, url: str, referer: str = "", poll: bool = False,
+        session: Optional[http.Session] = None,
+    ):
         """GET a JSON endpoint, reporting the server's ETag alongside the body.
 
         Returns ``(payload, etag, from_cache)``. ``payload`` is ``None`` only
@@ -313,24 +328,30 @@ class AisClient:
         if referer:
             headers["Referer"] = referer
 
-        with self._etag_lock:
-            cached = self._etag_cache.get(url)
+        # Racing routes fetch independent snapshots. A late response must not
+        # modify the main session's cache or replay the other route's result.
+        use_cache = session is None
+        session = self.session if session is None else session
+        cached = None
+        if use_cache:
+            with self._etag_lock:
+                cached = self._etag_cache.get(url)
         if cached:
             headers["If-None-Match"] = cached[0]
 
-        fallbacks = getattr(self.session, "gateway_fallbacks", 0)
+        fallbacks = getattr(session, "gateway_fallbacks", 0)
         try:
-            if poll and getattr(self.session, "poll_gateway", None) is not None:
-                resp = self.session.get(url, headers=headers, timeout=self.timeout, poll=True)
+            if poll and getattr(session, "poll_gateway", None) is not None:
+                resp = session.get(url, headers=headers, timeout=self.timeout, poll=True)
             else:
-                resp = self.session.get(url, headers=headers, timeout=self.timeout)
+                resp = session.get(url, headers=headers, timeout=self.timeout)
         except http.RequestException as exc:
             self._log(f"request failed: {exc}")
             return None, None, False
-        if getattr(self.session, "gateway_fallbacks", 0) != fallbacks:
+        if getattr(session, "gateway_fallbacks", 0) != fallbacks:
             self._log(
-                f"gateway could not poll ({self.session.last_gateway_failure}); "
-                "used the direct route instead"
+                f"gateway could not poll ({session.last_gateway_failure}); "
+                "used the session route instead"
             )
 
         if resp.status_code == 304:
@@ -362,7 +383,7 @@ class AisClient:
             return None, None, False
 
         etag = resp.headers.get("ETag")
-        if etag:
+        if use_cache and etag:
             with self._etag_lock:
                 self._etag_cache[url] = (etag, payload)
         return payload, etag, False
@@ -721,27 +742,108 @@ class AisClient:
         started = time.perf_counter()
         times = None
         try:
-            times = self._read_available_times(schedule_id, facility_id, day)
+            if self._times_socks_proxy:
+                times = self._race_available_times(schedule_id, facility_id, day)
+            else:
+                times = self._read_available_times(schedule_id, facility_id, day)
             return times
         finally:
-            if times is None:
-                outcome = "request failed"
-            elif not times:
-                outcome = "no time slots"
-            else:
-                outcome = f"{len(times)} time slot(s) available"
             self._log(
                 f"times.json for schedule {schedule_id}, {consulate_name(facility_id)} "
-                f"@ {day}: {outcome} ({time.perf_counter() - started:.3f}s)"
+                f"@ {day}: {self._times_outcome(times)} ({time.perf_counter() - started:.3f}s)"
             )
 
-    def _read_available_times(
+    @staticmethod
+    def _times_outcome(times: Optional[List[str]]) -> str:
+        if times is None:
+            return "request failed"
+        return f"{len(times)} time slot(s) available" if times else "no time slots"
+
+    def _race_available_times(
         self, schedule_id: str, facility_id: int, day: date
     ) -> Optional[List[str]]:
-        data = self._get_json(
-            self.times_url(schedule_id, facility_id, day),
-            referer=self.appointment_url(schedule_id),
+        label = (
+            f"times.json race {next(self._times_lookup_ids)} for schedule {schedule_id}, "
+            f"{consulate_name(facility_id)} @ {day}"
         )
+        proxy = self._times_socks_proxy
+        routes = (("direct", ""), (proxy.partition("://")[0].lower(), proxy))
+        # Capture the signed-in state before launching either GET. Each route
+        # gets its own cookie jar, including while the winner is being booked.
+        headers = self.session.headers.copy()
+        cookies = http.Cookies(self.session.cookies)
+        attempts = self.session.attempts
+        impersonate = self.session.impersonate
+        results: Queue[Tuple[str, Optional[List[str]], Optional[Exception], float]] = Queue()
+
+        def lookup(route: str, route_proxy: str, release: Callable[[], None]) -> None:
+            started = time.perf_counter()
+            times = None
+            error = None
+            try:
+                with http.urgent(), http.Session(
+                    headers=headers, cookies=cookies, attempts=attempts, impersonate=impersonate,
+                    proxy=route_proxy or None,
+                    curl_options={http.CurlOpt.NOPROXY: "" if route_proxy else "*"},
+                ) as session:
+                    times = self._read_available_times(
+                        schedule_id, facility_id, day, session, trace_label=f"{label} {route} HTTP",
+                    )
+                    if times:
+                        times = [value for value in times if SITE_TIME_RE.fullmatch(value)] or None
+            except Exception as exc:  # one failed route must not stop the other
+                times, error = None, exc
+            finally:
+                elapsed = time.perf_counter() - started
+                release()
+                results.put((route, times, error, elapsed))
+                outcome = type(error).__name__ if error else self._times_outcome(times)
+                self._log(f"{label} route={route}: {outcome} ({elapsed:.3f}s)")
+
+        active = 0
+        for (route, route_proxy), lock in zip(routes, self._times_route_locks):
+            if not lock.acquire(blocking=False):
+                self._log(f"{label} route={route}: skipped, previous query still in flight")
+                continue
+            try:
+                threading.Thread(target=lookup, args=(route, route_proxy, lock.release),
+                                 daemon=True).start()
+            except RuntimeError:
+                lock.release()
+                self._log(f"{label} route={route}: could not start query")
+            else:
+                active += 1
+
+        empty = 0
+        expired = []
+        for _ in range(active):
+            route, times, error, elapsed = results.get()
+            if times:
+                self._log(f"{label} winner={route} ({elapsed:.3f}s)")
+                return times
+            if times == []:
+                empty += 1
+            if isinstance(error, SessionExpired):
+                expired.append(error)
+        self._log(f"{label} winner=none")
+        if len(expired) == len(routes):
+            raise expired[0]
+        return [] if empty == len(routes) else None
+
+    def _read_available_times(
+        self, schedule_id: str, facility_id: int, day: date,
+        session: Optional[http.Session] = None, trace_label: str = "",
+    ) -> Optional[List[str]]:
+        label = trace_label or (
+            f"times.json HTTP for schedule {schedule_id}, {consulate_name(facility_id)} @ {day}"
+        )
+        with http.log_attempts(self._log, label):
+            url = self.times_url(schedule_id, facility_id, day)
+            referer = self.appointment_url(schedule_id)
+            if session is None:
+                data = self._get_json(url, referer=referer)
+            else:
+                data, _, _ = self._get_json_meta(url, referer=referer, session=session)
         if data is None:
             return None
         fields = ("available_times", "business_times")
@@ -945,6 +1047,7 @@ class AisClient:
         most recently seen time. A wrong guess costs one extra POST and then
         proceeds normally. Off by default: what the site does with a POST
         naming an unavailable time cannot be established without sending one.
+        A dual-route lookup always resolves the time before the single POST.
         """
         self._log(
             f"booking with prewarmed form for schedule {slot.schedule_id} "
@@ -955,7 +1058,7 @@ class AisClient:
         payload[DATE_KEY] = slot.day.isoformat()
 
         guess = ""
-        if speculative and not slot.time:
+        if speculative and not slot.time and not self._times_socks_proxy:
             roster = (warmed.known_times or {}).get(slot.facility_id) or []
             if roster:
                 guess = roster[0]
