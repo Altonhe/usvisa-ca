@@ -94,9 +94,10 @@ class Link:
 class Page(HTMLParser):
     """Parsed view of one HTML response."""
 
-    def __init__(self, html: str, base_url: str = ""):
+    def __init__(self, html: str, base_url: str = "", used_proxy: Optional[bool] = None):
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
+        self.used_proxy = used_proxy
         # Raw markup, kept for the few lookups that need document position
         # rather than parsed structure (e.g. which card an element sits in).
         self.html = html

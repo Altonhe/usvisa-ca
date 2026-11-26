@@ -11,6 +11,7 @@ from threading import Barrier, Event
 
 import pytest
 
+from app import httpclient as http
 from app.ais_client import AisClient, PrewarmedForm, SessionExpired, Slot
 from app.config import Config, DashboardConfig, TelegramConfig
 from app.htmlutil import Page
@@ -213,53 +214,94 @@ def test_booking_distinguishes_empty_times_from_failed_lookups(
     assert all(f": {outcome} (" in line and line.endswith("s)") for line in lookups)
 
 
-def test_first_valid_route_can_book_while_the_other_route_is_running(monkeypatch):
+@pytest.mark.parametrize("winner", ["direct", "socks5h"])
+def test_both_routes_submit_the_first_valid_time_while_other_lookup_runs(monkeypatch, winner):
     logs = []
-    both_running = Barrier(2)
-    release_proxy = Event()
-    proxy_logged = Event()
+    both_lookup = Barrier(2)
+    both_post = Barrier(2)
+    release_loser = Event()
+    loser_logged = Event()
     posts = []
+    forms = []
     proxy_url = "socks5h://proxy.invalid:1080"
+    loser = "socks5h" if winner == "direct" else "direct"
+    winning_time = "07:15" if winner == "direct" else "08:30"
 
     def log(line):
         logs.append(line)
-        if "route=socks5h: " in line:
-            proxy_logged.set()
+        if line.startswith("times.json race") and f"route={loser}: " in line:
+            loser_logged.set()
 
     c = AisClient("a@example.com", "p", logger=log, times_socks_proxy=proxy_url)
     c.session.cookies.set("_yatri_session", "signed-in", domain="ais.usvisa-info.com")
 
-    def times(schedule_id, facility_id, day, session, **kwargs):
-        if session.proxies:
-            assert session.proxies["all"] == proxy_url
-            session.cookies.set("_yatri_session", "losing-cookie", domain="ais.usvisa-info.com")
-            both_running.wait(timeout=3)
-            assert release_proxy.wait(timeout=3)
-            return ["08:30"]
-        both_running.wait(timeout=3)
-        assert session.cookies.get("_yatri_session") == "signed-in"
-        return ["07:15"]
+    def route_of(session):
+        return "socks5h" if session.proxies else "direct"
 
-    def post(url, data, **kwargs):
-        posts.append(data)
-        assert not proxy_logged.is_set()
-        return Resp(200, text="successfully scheduled")
+    def times(schedule_id, facility_id, day, session, **kwargs):
+        route = route_of(session)
+        if route == loser:
+            session.cookies.set("_yatri_session", "losing-cookie", domain="ais.usvisa-info.com")
+        both_lookup.wait(timeout=3)
+        if route == loser:
+            assert release_loser.wait(timeout=3)
+            return ["09:00"]
+        return [winning_time]
+
+    def open_form(schedule_id):
+        route = route_of(c._page_session)
+        forms.append(route)
+        return Page(
+            f'<form id="appointment-form" action="/submit">'
+            f'<input type="hidden" name="authenticity_token" value="{route}-token"></form>',
+            base_url="https://ais.usvisa-info.com/appointment", used_proxy=(route != "direct"),
+        )
+
+    def post(session, url, data, **kwargs):
+        route = route_of(session)
+        assert session is not c.session
+        assert session.cookies.get("_yatri_session") == "signed-in"
+        assert not loser_logged.is_set()
+        assert not kwargs["allow_redirects"]
+        posts.append((route, data["authenticity_token"], data["appointments[consulate_appointment][time]"]))
+        both_post.wait(timeout=3)
+        return Resp(200, text="successfully scheduled") if route == winner else Resp(403, text="invalid")
 
     monkeypatch.setattr(c, "_read_available_times", times)
-    monkeypatch.setattr(c.session, "post", post)
+    monkeypatch.setattr(c, "open_appointment_page", open_form)
+    monkeypatch.setattr(c, "current_appointment", lambda schedule_id: None)
+    monkeypatch.setattr(http.Session, "post", post)
+    warmed = c.prewarm_booking("111")
+    warmed.known_times = {94: ["06:30"]}
     slot = Slot("111", 94, date(2027, 7, 29))
     try:
-        # Even an enabled speculative setting must yield to the route race.
-        assert c.book_prewarmed(slot, _warm({94: ["06:30"]}), dry_run=False, speculative=True)
-        assert slot.time == "07:15"
-        assert any("winner=direct" in line for line in logs)
+        assert c.book_prewarmed(slot, warmed, dry_run=False, speculative=True)
+        assert slot.time == winning_time
+        assert any(f"winner={winner}" in line for line in logs)
     finally:
-        release_proxy.set()
-        assert proxy_logged.wait(timeout=3)
+        release_loser.set()
+        assert loser_logged.wait(timeout=3)
 
-    assert any("route=socks5h: 1 time slot(s) available" in line for line in logs)
+    assert forms == ["direct", "socks5h"], "reuse the direct prewarm and fetch a form on SOCKS5"
     assert c.session.cookies.get("_yatri_session") == "signed-in"
-    assert len(posts) == 1
+    assert sorted(posts) == [("direct", "direct-token", winning_time),
+                             ("socks5h", "socks5h-token", winning_time)]
+
+
+@pytest.mark.parametrize("dry_run, times", [(True, ["07:15"]), (False, [])])
+def test_dual_booking_preserves_dry_run_and_requires_a_time(monkeypatch, dry_run, times):
+    c = AisClient("a@example.com", "p", times_socks_proxy="socks5h://proxy.invalid:1080")
+    forms = []
+
+    def open_form(schedule_id):
+        forms.append(schedule_id)
+        return Page('<form id="appointment-form" action="/submit"></form>')
+
+    monkeypatch.setattr(c, "get_available_times", lambda *args: times)
+    monkeypatch.setattr(c, "open_appointment_page", open_form)
+    monkeypatch.setattr(http.Session, "post", lambda *a, **kw: pytest.fail("unexpected final POST"))
+    assert c.book(Slot("111", 94, date(2027, 7, 29)), dry_run=dry_run) is False
+    assert len(forms) == (2 if times else 0)
 
 
 @pytest.mark.parametrize("direct_result", [[], None, ["invalid"], SessionExpired("401")])

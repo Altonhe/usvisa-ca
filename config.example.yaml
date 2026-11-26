@@ -161,7 +161,7 @@ network:
   openvpn_provider_url: ""        # http://openvpn-provider:8080
   # Use the proxy stored as AIS_PROXY for the primary AIS session
   # (e.g. socks5h://user:pass@host:1080; socks5h resolves DNS on the proxy).
-  # Off: direct. Sign-in, discovery and booking always take this route.
+  # Off: direct. Sign-in and discovery use the primary session's route.
   use_proxy: false
   # Poll days.json through the HTTP gateway stored as STARLINK_GATEWAY_URL /
   # STARLINK_GATEWAY_KEY ({"target","method","headers"} + X-Starlink-Key).
@@ -175,6 +175,7 @@ network:
   # back as soon as a profile is accepted.
   # With a SOCKS5 proxy configured, this also allows times.json to query both
   # routes in parallel. The first response with usable times supplies the slot.
+  # Both routes then attempt to submit that slot once.
   direct_fallback: false
   vpn_retry_interval: 300
   # Seconds to wait for a switched profile to connect.

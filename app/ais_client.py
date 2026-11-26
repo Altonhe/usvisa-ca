@@ -29,15 +29,17 @@ import json
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from html import unescape
 from itertools import count
 from pathlib import Path
 from queue import Queue
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from . import httpclient as http
 
@@ -67,6 +69,16 @@ def _usable_time(value) -> bool:
     return bool(text) and text.lower() not in ("none", "null")
 
 
+def _cookie_state(cookies: http.Cookies) -> frozenset[tuple]:
+    return frozenset((c.domain, c.path, c.name, c.value, c.secure) for c in cookies.jar)
+
+
+def _response_page(response: http.Response) -> Page:
+    used_proxy = getattr(response, "infos", {}).get(http.CurlInfo.USED_PROXY)
+    return Page(response.text, base_url=response.url,
+                used_proxy=None if used_proxy is None else bool(used_proxy))
+
+
 @dataclass
 class PrewarmedForm:
     """A booking form fetched and parsed ahead of a match.
@@ -90,6 +102,9 @@ class PrewarmedForm:
     # Time-slot strings seen at each facility, newest first. Used only by
     # speculative booking to guess a plausible time before times.json answers.
     known_times: Dict[int, List[str]] = None  # type: ignore[assignment]
+    source_proxy: Optional[str] = field(default=None, repr=False)
+    source_cookies: Optional[frozenset[tuple]] = field(default=None, repr=False)
+    source_user_agent: str = ""
 
     def age(self) -> float:
         return time.monotonic() - self.fetched_at
@@ -184,6 +199,7 @@ class AisClient:
         max_connections: int = 4,
         logger: Optional[Callable[[str], None]] = None,
         times_socks_proxy: str = "",
+        booking_prewarm_ttl: float = 120.0,
     ):
         if not email or not password:
             raise AisError("account email/password are not configured")
@@ -210,6 +226,10 @@ class AisClient:
         # per route in flight for this client, including across repeat lookups.
         self._times_route_locks = (threading.Lock(), threading.Lock())
         self._times_lookup_ids = count(1)
+        self._booking_prewarm_ttl = booking_prewarm_ttl
+        self._booking_transport: ContextVar[Optional[Tuple[str, http.Session]]] = ContextVar(
+            "booking_transport", default=None,
+        )
         # curl_cffi with a Chrome TLS fingerprint. The availability sweep fires
         # several days.json calls at once; the session keeps one libcurl handle
         # per thread, so concurrent calls each get their own connection while
@@ -262,6 +282,11 @@ class AisClient:
 
     # -- plumbing --------------------------------------------------------
 
+    @property
+    def _page_session(self) -> http.Session:
+        transport = self._booking_transport.get()
+        return self.session if transport is None else transport[1]
+
     def _get_page(self, url: str, referer: str = "") -> Page:
         """GET an HTML page, retrying once on a transient network error.
 
@@ -275,9 +300,9 @@ class AisClient:
         last: Optional[Exception] = None
         for attempt in range(2):
             try:
-                resp = self.session.get(url, headers=headers, timeout=self.timeout)
+                resp = self._page_session.get(url, headers=headers, timeout=self.timeout)
                 resp.raise_for_status()
-                return Page(resp.text, base_url=resp.url)
+                return _response_page(resp)
             except (http.Timeout, http.ConnectionError) as exc:
                 last = exc
                 if attempt == 0:
@@ -388,8 +413,9 @@ class AisClient:
                 self._etag_cache[url] = (etag, payload)
         return payload, etag, False
 
-    def _post_form(self, url: str, payload: Dict[str, str], page: Page) -> http.Response:
-        return self.session.post(
+    def _post_form(self, url: str, payload: Dict[str, str], page: Page,
+                   *, allow_redirects: bool = True) -> http.Response:
+        return self._page_session.post(
             url,
             data=payload,
             headers={
@@ -399,7 +425,7 @@ class AisClient:
                 "Content-Type": "application/x-www-form-urlencoded",
             },
             timeout=self.timeout,
-            allow_redirects=True,
+            allow_redirects=allow_redirects,
         )
 
     # -- captcha ---------------------------------------------------------
@@ -432,12 +458,13 @@ class AisClient:
             invisible=challenge["invisible"],
             version=challenge["version"],
         )
+        session = self._page_session
         for cookie in ("recaptcha-ca-t", "recaptcha-ca-e"):
             if solution.get(cookie):
-                self.session.cookies.set(cookie, solution[cookie], domain="ais.usvisa-info.com")
+                session.cookies.set(cookie, solution[cookie], domain="ais.usvisa-info.com")
         if solution.get("userAgent"):
             # The token is bound to the UA that solved it.
-            self.session.headers["User-Agent"] = solution["userAgent"]
+            session.headers["User-Agent"] = solution["userAgent"]
         return {challenge["response_field"]: solution["gRecaptchaResponse"]}
 
     # -- authentication --------------------------------------------------
@@ -759,6 +786,19 @@ class AisClient:
             return "request failed"
         return f"{len(times)} time slot(s) available" if times else "no time slots"
 
+    def _routes(self) -> Tuple[Tuple[str, str], Tuple[str, str]]:
+        proxy = self._times_socks_proxy
+        return (("direct", ""), (proxy.partition("://")[0].lower(), proxy))
+
+    def _session_snapshot(self) -> dict:
+        return dict(headers=self.session.headers.copy(), cookies=http.Cookies(self.session.cookies),
+                    attempts=self.session.attempts, impersonate=self.session.impersonate)
+
+    @staticmethod
+    def _route_session(proxy: str, snapshot: dict) -> http.Session:
+        return http.Session(proxy=proxy or None, **snapshot,
+                            curl_options={http.CurlOpt.NOPROXY: "" if proxy else "*"})
+
     def _race_available_times(
         self, schedule_id: str, facility_id: int, day: date
     ) -> Optional[List[str]]:
@@ -766,14 +806,10 @@ class AisClient:
             f"times.json race {next(self._times_lookup_ids)} for schedule {schedule_id}, "
             f"{consulate_name(facility_id)} @ {day}"
         )
-        proxy = self._times_socks_proxy
-        routes = (("direct", ""), (proxy.partition("://")[0].lower(), proxy))
+        routes = self._routes()
         # Capture the signed-in state before launching either GET. Each route
         # gets its own cookie jar, including while the winner is being booked.
-        headers = self.session.headers.copy()
-        cookies = http.Cookies(self.session.cookies)
-        attempts = self.session.attempts
-        impersonate = self.session.impersonate
+        snapshot = self._session_snapshot()
         results: Queue[Tuple[str, Optional[List[str]], Optional[Exception], float]] = Queue()
 
         def lookup(route: str, route_proxy: str, release: Callable[[], None]) -> None:
@@ -781,11 +817,7 @@ class AisClient:
             times = None
             error = None
             try:
-                with http.urgent(), http.Session(
-                    headers=headers, cookies=cookies, attempts=attempts, impersonate=impersonate,
-                    proxy=route_proxy or None,
-                    curl_options={http.CurlOpt.NOPROXY: "" if route_proxy else "*"},
-                ) as session:
+                with http.urgent(), self._route_session(route_proxy, snapshot) as session:
                     times = self._read_available_times(
                         schedule_id, facility_id, day, session, trace_label=f"{label} {route} HTTP",
                     )
@@ -876,8 +908,10 @@ class AisClient:
         try:
             yield
         finally:
+            transport = self._booking_transport.get()
+            route = f" route={transport[0]}" if transport is not None else ""
             self._log(
-                f"booking {step} for schedule {slot.schedule_id} took "
+                f"booking {step} for schedule {slot.schedule_id}{route} took "
                 f"{time.perf_counter() - started:.3f}s"
             )
 
@@ -945,7 +979,7 @@ class AisClient:
         payload.update(self._solve_captcha(page, target.action))
         self._log("acknowledging interstitial consent page")
         resp = self._post_form(target.action, payload, page)
-        return Page(resp.text, base_url=resp.url)
+        return _response_page(resp)
 
 
     def prewarm_booking(self, schedule_id: str, force: bool = False,
@@ -976,6 +1010,12 @@ class AisClient:
             payload.setdefault("commit", "Submit")
             # Solve now, off the hot path, if the site happens to be asking.
             payload.update(self._solve_captcha(page, form.action))
+            source_proxy = None
+            if page.used_proxy is False:
+                source_proxy = ""
+            elif page.used_proxy is True:
+                scheme = urlsplit(page.base_url).scheme
+                source_proxy = self.session.proxies.get(scheme) or self.session.proxies.get("all")
             warmed = PrewarmedForm(
                 schedule_id=schedule_id,
                 action=form.action,
@@ -984,6 +1024,9 @@ class AisClient:
                 csrf_token=page.csrf_token() or "",
                 fetched_at=time.monotonic(),
                 known_times={},
+                source_proxy=source_proxy,
+                source_cookies=_cookie_state(self.session.cookies),
+                source_user_agent=self.session.headers.get("User-Agent", ""),
             )
         except (AisError, http.RequestException) as exc:
             self._log(f"prewarm failed for {schedule_id} (ignored): {exc}")
@@ -1036,6 +1079,58 @@ class AisClient:
         dry_run: bool = True,
         speculative: bool = False,
     ) -> bool:
+        if self._times_socks_proxy:
+            return self._book_both_routes(slot, dry_run, warmed=warmed)
+        return self._book_prewarmed_form(slot, warmed, dry_run, speculative)
+
+    def _book_both_routes(
+        self, slot: Slot, dry_run: bool, *, warmed: Optional[PrewarmedForm] = None,
+        retry_attempts: int = 1, retry_delay: float = 0.0,
+    ) -> bool:
+        if not self._resolve_booking_time(slot, retry_attempts, retry_delay):
+            return False
+
+        snapshot = self._session_snapshot()
+        routes = self._routes()
+        self._log(f"booking for schedule {slot.schedule_id}: target {slot} for both routes")
+
+        def submit(route: str, proxy: str) -> bool:
+            started = time.perf_counter()
+            outcome = "failed"
+            try:
+                with http.urgent(), self._route_session(proxy, snapshot) as session:
+                    token = self._booking_transport.set((route, session))
+                    try:
+                        if (warmed is not None
+                                and warmed.schedule_id == slot.schedule_id
+                                and warmed.is_fresh(self._booking_prewarm_ttl)
+                                and warmed.source_proxy == proxy
+                                and warmed.source_user_agent == session.headers.get("User-Agent", "")
+                                and warmed.source_cookies == _cookie_state(session.cookies)):
+                            booked = self._book_prewarmed_form(slot, warmed, dry_run)
+                        else:
+                            booked = self._book_fresh_form(slot, dry_run, 1, 0.0)
+                        outcome = "dry run" if dry_run else "confirmed" if booked else "unconfirmed"
+                        return booked
+                    finally:
+                        self._booking_transport.reset(token)
+            except Exception as exc:
+                outcome = type(exc).__name__
+                return False
+            finally:
+                self._log(
+                    f"booking for schedule {slot.schedule_id} route={route}: {outcome} "
+                    f"({time.perf_counter() - started:.3f}s)"
+                )
+
+        with ThreadPoolExecutor(max_workers=len(routes)) as pool:
+            submissions = [pool.submit(submit, route, proxy) for route, proxy in routes]
+            results = [submission.result() for submission in submissions]
+        return any(results)
+
+    def _book_prewarmed_form(
+        self, slot: Slot, warmed: PrewarmedForm, dry_run: bool, speculative: bool = False,
+    ) -> bool:
         """Submit a booking using an already-parsed form.
 
         The hot path is only ``times.json`` (when the time is not already
@@ -1047,7 +1142,7 @@ class AisClient:
         most recently seen time. A wrong guess costs one extra POST and then
         proceeds normally. Off by default: what the site does with a POST
         naming an unavailable time cannot be established without sending one.
-        A dual-route lookup always resolves the time before the single POST.
+        Parallel submissions resolve the time first and never try a guess.
         """
         self._log(
             f"booking with prewarmed form for schedule {slot.schedule_id} "
@@ -1104,16 +1199,11 @@ class AisClient:
             )
             return False
 
-        with self._log_booking_step(slot, "POST"):
-            resp = self._post_prewarmed(payload, warmed)
-        # A used token cannot be reused, and the form state is now stale.
-        self.invalidate_prewarm(slot.schedule_id)
-        with self._log_booking_step(slot, "confirmation"):
-            return self._confirm_booking(slot, resp, Page(resp.text, base_url=resp.url))
+        return self._submit_booking(slot, lambda: self._post_prewarmed(payload, warmed))
 
     def _post_prewarmed(self, payload, warmed):
         """POST a booking using the pre-warmed form's token and referer."""
-        return self.session.post(
+        return self._page_session.post(
             warmed.action,
             data=payload,
             headers={
@@ -1123,7 +1213,7 @@ class AisClient:
                 "Content-Type": "application/x-www-form-urlencoded",
             },
             timeout=self.timeout,
-            allow_redirects=True,
+            allow_redirects=self._booking_transport.get() is None,
         )
 
 
@@ -1133,6 +1223,34 @@ class AisClient:
         dry_run: bool = True,
         retry_attempts: int = 1,
         retry_delay: float = 0.0,
+    ) -> bool:
+        if self._times_socks_proxy:
+            return self._book_both_routes(
+                slot, dry_run, retry_attempts=retry_attempts, retry_delay=retry_delay,
+            )
+        return self._book_fresh_form(slot, dry_run, retry_attempts, retry_delay)
+
+    def _resolve_booking_time(self, slot: Slot, retry_attempts: int, retry_delay: float) -> bool:
+        if not slot.time:
+            for attempt in range(1, max(1, retry_attempts) + 1):
+                times = self.get_available_times(slot.schedule_id, slot.facility_id, slot.day)
+                if times:
+                    slot.time = times[0]
+                    break
+                if attempt < retry_attempts:
+                    with self._log_booking_step(
+                        slot, f"wait before times.json attempt {attempt + 1}/{retry_attempts}"
+                    ):
+                        time.sleep(retry_delay)
+            if not slot.time:
+                return False
+        if not _usable_time(slot.time):
+            self._log(f"refusing to book {slot}: no usable time slot ({slot.time!r})")
+            return False
+        return True
+
+    def _book_fresh_form(
+        self, slot: Slot, dry_run: bool, retry_attempts: int, retry_delay: float,
     ) -> bool:
         """Submit the appointment form for ``slot``.
 
@@ -1159,22 +1277,7 @@ class AisClient:
         payload[FACILITY_KEY] = str(slot.facility_id)
         payload[DATE_KEY] = slot.day.isoformat()
 
-        if not slot.time:
-            times: Optional[List[str]] = None
-            for attempt in range(1, max(1, retry_attempts) + 1):
-                times = self.get_available_times(slot.schedule_id, slot.facility_id, slot.day)
-                if times:
-                    break
-                if attempt < retry_attempts:
-                    with self._log_booking_step(
-                        slot, f"wait before times.json attempt {attempt + 1}/{retry_attempts}"
-                    ):
-                        time.sleep(retry_delay)
-            if not times:
-                return False
-            slot.time = times[0]
-        if not _usable_time(slot.time):
-            self._log(f"refusing to book {slot}: no usable time slot ({slot.time!r})")
+        if not self._resolve_booking_time(slot, retry_attempts, retry_delay):
             return False
         payload[TIME_KEY] = slot.time
         payload.setdefault("commit", "Submit")
@@ -1191,10 +1294,26 @@ class AisClient:
             )
             return False
 
-        with self._log_booking_step(slot, "POST"):
-            resp = self._post_form(form.action, payload, page)
+        return self._submit_booking(slot, lambda: self._post_form(
+            form.action, payload, page, allow_redirects=self._booking_transport.get() is None,
+        ))
+
+    def _submit_booking(self, slot: Slot, post: Callable[[], http.Response]) -> bool:
+        try:
+            with self._log_booking_step(slot, "POST"):
+                resp = post()
+        except http.RequestException:
+            if self._booking_transport.get() is not None:
+                with self._log_booking_step(slot, "confirmation after POST error"):
+                    shown = self.current_appointment(slot.schedule_id)
+                if parse_site_date(shown or "") == slot.day:
+                    self._log(f"site confirmed the booking after a POST error: {slot}")
+                    return True
+            raise
+        finally:
+            self.invalidate_prewarm(slot.schedule_id)
         with self._log_booking_step(slot, "confirmation"):
-            return self._confirm_booking(slot, resp, Page(resp.text, base_url=resp.url))
+            return self._confirm_booking(slot, resp, _response_page(resp))
 
     def _confirm_booking(self, slot: Slot, resp, result: Page) -> bool:
         """Decide whether the POST actually moved the appointment."""

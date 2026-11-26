@@ -1075,6 +1075,7 @@ class Worker:
             times_socks_proxy=(
                 self.config.network.proxy if self.config.network.direct_fallback else ""
             ),
+            booking_prewarm_ttl=self.config.booking_prewarm_ttl,
         )
         session_path = self._session_path(account.name)
         resumed = False
